@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Node / frontend
+node_modules/
+frontend/dist/
+*.local
+
+# Secrets — 绝不提交
+.env
+*.env
+!.env.example
+
+# 数据库与运行数据
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
