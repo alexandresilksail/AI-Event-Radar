@@ -1,45 +1,50 @@
-# API 文档
+# API 文档（v1.1 更新）
 
-交互式文档：启动后端后访问 `http://localhost:8000/docs`（Swagger UI）。
+交互式文档：启动后访问 `http://<host>/docs`。
 
-## 认证
+## 认证与安全
 
 写操作需 `Authorization: Bearer <token>`；读操作（GET）公开。
-获取 token：`POST /auth/login {"username","password"}` → `{"token"}`，有效期 12 小时。
+`POST /auth/login` 获取 token（12 小时有效）。
 
-## 端点一览
+| 端点（新增） | 说明 |
+|---|---|
+| POST /auth/change-password | 已登录修改密码（旧密码校验，≥12 位） |
+| POST /auth/reset-password | 安全重置（需 .env 的 ADMIN_RESET_TOKEN，未配置返回 403） |
+| GET /health/live | 存活探针（无副作用，Docker HEALTHCHECK 用） |
+| GET /health/ready | 就绪探针（检查数据库；不可用时返回 503，不伪装 ready） |
+| GET /status | 含 role、leader_holder、running_task_source_ids 的真实状态 |
+| GET /health | 旧版兼容健康检查 |
+
+## 完整端点
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | /auth/login | 登录，返回 JWT |
-| GET | /status | 调度器/任务/配置状态（真实状态，非模拟） |
-| GET | /health | 健康检查（含数据库连通性） |
-| GET | /sources | 数据源列表（含失败次数/最近错误/贡献量） |
-| POST | /sources | 新增数据源（需认证；频率≥5分钟；类型白名单校验） |
-| PUT | /sources/{id} | 编辑 |
-| DELETE | /sources/{id} | 删除 |
-| POST | /sources/{id}/pause · /resume · /approve | 暂停 / 恢复 / 候选源审核启用 |
-| POST | /sources/{id}/trigger | 手动采集（同步、含指数退避重试） |
-| POST | /sources/{id}/test | 连通性测试（不写入活动） |
-| GET | /events | 活动列表。筛选：q, country, city, type, confidence, verified, finished, free, start_from, start_to |
-| GET | /events/{id} | 详情（含全部来源/变更历史/原文链接） |
-| GET | /calendar?view=month|week&date= | 日历视图数据 |
-| GET | /crawl-logs | 采集日志（按日期/数据源/状态筛选） |
-| GET | /stats/dashboard | 仪表盘统计 |
-| GET | /stats/analysis | 情报分析统计 |
-| GET/POST/PUT/DELETE | /notification-rules | 通知规则 CRUD（GET 对凭证打码） |
-| POST | /notification-rules/{id}/test | 测试发送（如实报告失败原因） |
-| GET | /settings | 非敏感系统配置 |
-| PUT | /settings/system_setting?key= | 写入非敏感配置（敏感键 400 拒绝） |
+| POST | /auth/login · /auth/change-password · /auth/reset-password | 认证 |
+| GET | /status · /health(/live)(/ready) | 状态与探针 |
+| GET | /sources | 数据源列表 |
+| POST/PUT/DELETE | /sources[/{id}] | 数据源 CRUD（需认证） |
+| POST | /sources/{id}/pause · /resume · /approve · /trigger · /test | 管理操作 |
+| GET | /events | 筛选：q, country, city, type, confidence, verified, finished, free, start_from/to |
+| GET | /events/{id} | 详情（含来源、变更历史） |
+| GET | /calendar | 日历数据 |
+| GET | /crawl-logs | 采集日志 |
+| GET | /stats/dashboard · /stats/analysis | 统计 |
+| GET/POST/PUT/DELETE | /notification-rules[/{id}[/test]] | 通知规则 |
+| GET/PUT | /settings · /settings/system_setting | 非敏感配置 |
 
-## 数据源 method 配置示例
+## SSRF/采集安全（safe_get 行为）
 
-```json
-// HTML 列表页
-{"list_selector": "div.event-item", "title": "h3 a", "link": "h3 a@href",
- "fields": {"city": ".city", "date": ".date"}}
-// JSON API
-{"path_to_array": "data.items", "url_field": "url", "title_field": "title"}
-// 搜索发现
-{"keywords": ["人工智能大会", "AI summit"], "freshness": "m30", "num": 10}
+- 每跳重定向都重新校验（公共域名重定向到内网/元数据 → `SSRF 防护拦截（第 N 跳）`）。
+- 重定向上限 3 跳（MAX_REDIRECTS）；响应体上限 5MB（MAX_RESPONSE_BYTES）。
+- 域名解析结果经守护型解析器过滤，连接时也拒绝解析到内网的目标。
+
+## Alembic 迁移
+
+```bash
+cd backend
+alembic upgrade head        # 应用迁移（升级）
+alembic downgrade -1        # 回滚一步
+alembic history             # 查看历史
 ```
+应用启动时会自动执行 `migrate_or_init()`：新库建立结构；老库补齐新表并 stamp 基线（数据保留）。

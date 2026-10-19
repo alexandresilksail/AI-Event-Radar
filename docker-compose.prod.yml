@@ -1,0 +1,63 @@
+# AI Event Radar — production composition (OCI ARM64 Ubuntu friendly).
+# Usage: cp .env.example .env && edit values && docker compose -f docker-compose.prod.yml up -d
+name: ai-event-radar
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${DB_USER:-radar}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?required, set in .env}
+      POSTGRES_DB: ${DB_NAME:-radar}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
+
+  api:
+    build: { context: ., dockerfile: Dockerfile.api }
+    env_file: .env
+    environment:
+      ROLE: api
+      DATABASE_URL: postgresql+psycopg://${DB_USER:-radar}:${DB_PASSWORD}@db:5432/${DB_NAME:-radar}
+    depends_on: { db: { condition: service_healthy } }
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
+
+  worker:
+    build: { context: ., dockerfile: Dockerfile.api }
+    command: ["python", "-m", "app.worker"]
+    env_file: .env
+    environment:
+      ROLE: worker
+      DATABASE_URL: postgresql+psycopg://${DB_USER:-radar}:${DB_PASSWORD}@db:5432/${DB_NAME:-radar}
+    depends_on: { db: { condition: service_healthy } }
+    networks: [internal]
+    restart: unless-stopped
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
+
+  web:
+    build: { context: ., dockerfile: Dockerfile.web }
+    depends_on: [api]
+    ports:
+      - "${HTTP_PORT:-80}:80"
+    networks: [internal]
+    restart: unless-stopped
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
+
+networks:
+  internal: { internal: false }
+volumes:
+  pgdata:

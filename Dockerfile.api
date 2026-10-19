@@ -1,0 +1,22 @@
+# syntax=docker/dockerfile:1
+# API image: FastAPI web role. Scheduler runs in the separate worker service.
+FROM python:3.13-slim-bookworm AS builder
+WORKDIR /w
+COPY backend/requirements.txt .
+RUN pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt
+
+FROM python:3.13-slim-bookworm AS runtime
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /wheels /wheels
+RUN pip install --no-cache-dir --no-index --find-links=/wheels /wheels/*.whl
+COPY backend/app ./app
+COPY backend/alembic.ini ./alembic.ini
+COPY backend/alembic ./alembic
+
+RUN mkdir -p /app/data && useradd -r -u 10001 radar && chown -R radar /app
+USER radar
+ENV ROLE=api
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD curl -fsS http://localhost:8000/health/live || exit 1
+CMD ["sh", "-c", "cd /app && python -c 'from app.main import migrate_or_init; migrate_or_init()' && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"]

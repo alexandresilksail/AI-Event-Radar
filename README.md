@@ -3,48 +3,65 @@
 7×24 小时持续监控互联网公开渠道，自动发现、识别、去重、核实并推送 AI 相关活动预告。
 **所有仪表盘数字均来自真实数据库，系统不生成任何模拟/假数据。**
 
-## 实际可用的数据源类型（已实现并测试）
+## 架构（v1.1 生产架构）
 
-| 类型 | 说明 | 凭证需求 | 状态 |
-|---|---|---|---|
-| RSS / Atom | feedparser 解析，公开订阅源 | 无 | ✅ 已实现，真实 E2E 测试通过（MIT News AI） |
-| HTML 网页解析 | 按 sources.method 中的 CSS 选择器配置 | 无 | ✅ 已实现（选择器按源配置，不硬编码） |
-| 官方 API (JSON) | 通用 JSON API + path_to_array 配置 | 视 API 而定 | ✅ 已实现框架 |
-| Sitemap | 解析 sitemap.xml 并抽样抓取 | 无 | ✅ 已实现 |
-| 页面变更检测 | 内容哈希比对，变更才处理 | 无 | ✅ 已实现 |
-| 搜索引擎发现 | serper / tavily / bing，可插拔 | **需要 API Key** | ✅ 已实现，未配置 Key 时明确提示、不伪装 |
-| AI 结构化抽取 | OpenAI 兼容接口，JSON 输出 | **需要 API Key** | ✅ 已实现，未配置时回退规则抽取 |
-| 通知 | Webhook / 邮件 / Telegram / 企业微信 | 视通道而定 | ✅ 已实现，未配置凭证时记录 skipped 并继续运行 |
+```
+                ┌────────────┐
+   公网 80/443 →│  nginx/web │ 唯一公网入口：SPA 静态资源 + /api 反向代理
+                └─────┬──────┘
+              ┌───────┴───────┐
+              ▼               ▼
+        ┌──────────┐    ┌──────────┐
+        │   api    │    │  worker  │ 独立后台采集进程（APScheduler）
+        │ FastAPI  │    │ ROLE=worker
+        └────┬─────┘    └────┬─────┘
+             │               │  DB 领导锁：全局仅 1 个活跃调度器
+             └───────┬───────┘
+                     ▼
+              ┌────────────┐
+              │ PostgreSQL │ 仅内网通信
+              └────────────┘
+```
 
-## 受访问限制、暂不批量采集的来源
+- **api**：只处理 Web 请求，不启动调度器（ROLE=api）。
+- **worker**：`python -m app.worker`，通过数据库领导锁保证全集群只有一个活跃调度器；
+  worker 重启后从 sources 表恢复全部任务；API 重启不影响 worker。
+- **web**：多阶段构建的静态前端，由 Nginx 直接提供（运行时不执行 npm install）。
+- SSRF：所有出站请求逐跳校验 + 守护型 DNS 解析器（连接时也过滤内网解析结果）。
 
-- 微信公众号文章：受访问控制，不批量抓取；支持人工提交 URL 单条收录。
-- 需登录/验证码/付费墙的平台（部分 Meetup / Eventbrite 页面）：不绕过技术措施，
-  建议走官方 API（Eventbrite API 已在 APICollector 框架内可直接配置接入）。
+## 数据源插件（全部已实现并测试）
 
-## 快速开始（开发环境）
+| 类型 | 凭证需求 | 状态 |
+|---|---|---|
+| RSS / Atom | 无 | ✅ 真实 E2E 测试通过（MIT News AI） |
+| HTML 网页解析 | 无 | ✅ 按 sources.method 配置选择器 |
+| 官方 JSON API | 视 API | ✅ 含类型校验 |
+| Sitemap | 无 | ✅ |
+| 页面变更检测 | 无 | ✅ 状态持久化到 DB（source_states），重启不丢基线 |
+| 搜索引擎发现 | **需要 API Key** | ✅ serper/tavily/bing 可插拔，未配置明确提示 |
+| AI 结构化抽取 | **需要 API Key** | ✅ OpenAI 兼容接口，未配置自动回退规则抽取 |
+| 通知 | 视通道 | ✅ webhook/email/telegram/企业微信，(规则,活动,类型) 去重 |
 
+## 快速开始
+
+### 本地开发
 ```bash
-cd backend
-python -m venv .venv && .venv/Scripts/activate   # Windows
+cd backend && python -m venv .venv && .venv/Scripts/activate
 pip install -r requirements.txt
-copy ..\.env.example .env                        # 修改 ADMIN_PASSWORD / JWT_SECRET
-python scripts/seed_sources.py                   # 写入真实公开数据源
-uvicorn app.main:app --port 8000                 # 启动 API + 调度器
+cp ../.env.example .env   # ENV=dev 可用默认值
+python scripts/seed_sources.py
+uvicorn app.main:app --port 8000
 # 新终端
-cd frontend && npm install && npm run dev        # http://localhost:5173
+cd ../frontend && npm install && npm run dev
 ```
 
-登录：`admin` / `.env` 中的 `ADMIN_PASSWORD`。
-
-## Docker 部署
-
+### 生产部署（OCI ARM64 / 任意 Docker 主机）
 ```bash
-cp .env.example .env   # 必须修改 JWT_SECRET、ADMIN_PASSWORD、POSTGRES_PASSWORD
-docker compose up -d --build
-# API: http://localhost  (Nginx -> api:8000)
-# 控制台: http://localhost/web/
+cp .env.example .env        # 按注释填写 ENV=production、JWT_SECRET、ADMIN_PASSWORD、DB_PASSWORD、ALLOWED_ORIGINS
+bash scripts/deploy.sh      # 检查→构建→迁移→启动→健康检查，失败即中止并报错
 ```
+详见 `docs/DEPLOY.md`。备份：`bash scripts/backup.sh`；恢复：`bash scripts/restore.sh <file>`；
+体检：`bash scripts/healthcheck.sh`。
 
 ## 目录结构
 
@@ -52,52 +69,39 @@ docker compose up -d --build
 ai-event-radar/
 ├── backend/
 │   ├── app/
-│   │   ├── main.py            # FastAPI 入口（生命周期：建表/恢复调度）
-│   │   ├── config.py          # .env 配置
-│   │   ├── database.py        # SQLite(开发)/PostgreSQL(生产)
-│   │   ├── models.py          # 13 张表
-│   │   ├── security.py        # PBKDF2 + JWT + SSRF 防护
-│   │   ├── deps.py            # 认证依赖 + 审计日志
-│   │   ├── collectors/        # 采集插件（base/rss_sitemap/html_api/search）
-│   │   ├── services/          # pipeline/extraction/dedup/notifier/discovery/scheduler
-│   │   └── routers/           # auth/sources/events/notifications
-│   ├── tests/                 # 单元+集成+真实E2E（pytest -m real_network）
-│   └── scripts/seed_sources.py
-├── frontend/                  # React 18 + TypeScript + Vite（7 个页面）
-├── docs/                      # API 文档/部署/故障排查/安全审计/已知限制
-├── Dockerfile / docker-compose.yml / nginx.conf / .env.example
+│   │   ├── main.py            # FastAPI 入口 + 生产配置校验 + 迁移初始化
+│   │   ├── worker.py          # 独立采集进程入口（python -m app.worker）
+│   │   ├── config.py          # .env + 生产启动安全校验（P0）
+│   │   ├── security.py        # PBKDF2 + JWT + SSRF 逐跳校验 + 守护型 DNS
+│   │   ├── models.py          # 15 张表（含 scheduler_locks / source_states）
+│   │   ├── collectors/        # rss / html / api / sitemap / change_detection / search
+│   │   ├── services/          # pipeline / extraction / dedup / notifier / discovery / scheduler(DB锁)
+│   │   ├── routers/           # auth / sources / events / notifications / health
+│   │   ├── seed.py            # 幂等种子数据源（python -m app.seed）
+│   │   └── alembic 相关迁移在 backend/alembic/
+│   └── tests/                 # 82 项测试 + 2 项真实 E2E
+├── frontend/                  # React 18 + TS + Vite，8 页面
+├── scripts/                   # deploy / backup / restore / healthcheck
+├── docs/                      # API / DEPLOY / ACCEPTANCE / SECURITY / LIMITATIONS / TROUBLESHOOTING
+├── Dockerfile.api / Dockerfile.web / docker-compose.prod.yml / nginx.prod.conf
+└── .env.example / .gitattributes
 ```
 
-## 数据库表（13 张）
+## 安全要点（详见 docs/SECURITY.md）
 
-users, sources, crawl_tasks, crawl_logs, raw_documents, events, event_sources,
-event_history, event_tags, notification_rules, notification_logs, system_settings, audit_logs
+- 生产启动校验：默认 JWT_SECRET / 弱管理员密码 / SQLite / 通配 CORS 一律**拒绝启动**。
+- 管理员初始化幂等：只建号，**永不重置已存在密码**；支持凭密码修改与 ADMIN_RESET_TOKEN 重置。
+- SSRF：拒绝跳内网、云元数据、非 http(s)、重定向超限；DNS 解析后过滤；响应 5MB 上限。
+- 密钥只存服务端 .env；通知凭证在 API 打码；敏感配置禁止写入系统设置接口。
 
-## 核心机制
-
-- **调度**：APScheduler 按源频率执行；失败指数退避（连续失败翻倍，封顶 24h）；
-  同源任务不重叠；重启后从数据库恢复全部任务。
-- **状态区分**：`GET /status` 明确区分调度器运行 / 任务执行中 / 数据源健康 / 最近成功采集时间。
-- **去重（5 层）**：URL 规范化 → 名称相似度（SequenceMatcher）→ 主办方+时间 → 城市+报名地址 → 合并保留全部来源。同名不同活动不会被误删。
-- **可信度分级（规则生成，非 AI 自评）**：A=官方源或完整信息；B=时间地点齐全+多来源；C=单一非官方来源；待核实=关键字段缺失。
-- **抽取铁律**：网页内容视为不可信数据；页面中的指令一律忽略；未确认字段填「未知/待核实」，禁止编造。
-- **SSRF 防护**：协议白名单、localhost/内网/云元数据/DNS 重绑定拦截。
-- **通知去重**：`(rule, event, type)` 唯一约束，绝不重复推送。
-
-## 自动化测试
+## 测试
 
 ```bash
 cd backend
-pytest tests/ -m "not real_network"   # 49 项：单元/集成/安全/去重/通知/权限
+pytest tests/ -m "not real_network"   # 82 项：单元/集成/安全/迁移/启动配置/SSRF 重定向
 pytest tests/ -m real_network         # 2 项：真实公开源端到端采集
 ```
 
-最近一次结果：**49 passed + 2 passed（真实网络）**。
+## 24 小时验收
 
-## 24 小时运行验收方案
-
-见 `docs/ACCEPTANCE.md`。验收完成前，系统不会宣称已通过 24h 稳定性验收。
-
-## 尚未完成 / 依赖外部条件的事项
-
-见 `docs/LIMITATIONS.md`（微信内容合规接入、AI/搜索 Key 实际启用、24h 验收执行等）。
+见 `docs/ACCEPTANCE.md`。**未真实运行满 24 小时前不宣称通过稳定性验收。**

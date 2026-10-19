@@ -10,3 +10,5 @@ apscheduler>=3.10
 pyjwt>=2.8
 python-multipart>=0.0.9
 cryptography>=42.0
+alembic>=1.13
+psycopg[binary]>=3.2

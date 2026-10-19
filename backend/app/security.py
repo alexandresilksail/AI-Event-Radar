@@ -11,6 +11,61 @@ import jwt
 from .config import settings
 
 
+class SSRFError(Exception):
+    pass
+
+
+PRIVATE_V4 = [ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+    "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16",
+    "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4",
+)]
+PRIVATE_V6 = [ipaddress.ip_network(n) for n in ("::1/128", "fc00::/7", "fe80::/10", "ff00::/8")]
+
+_orig_getaddrinfo = socket.getaddrinfo
+_RESOLVER_INSTALLED = False
+
+
+def is_public_ip(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    nets = PRIVATE_V4 if ip.version == 4 else PRIVATE_V6
+    return not any(ip in n for n in nets)
+
+
+def install_guarded_resolver() -> None:
+    """Wrap socket.getaddrinfo so that DNS results actually used by connections
+    are filtered to public IPs. Closes the TOCTOU window between validation and
+    connect (DNS rebinding / per-hop re-resolution races).
+    Idempotent; called once at app/worker startup (and by tests)."""
+    global _RESOLVER_INSTALLED
+    if _RESOLVER_INSTALLED:
+        return
+    _RESOLVER_INSTALLED = True
+
+    def guarded_getaddrinfo(host, port, *args, **kwargs):
+        results = _orig_getaddrinfo(host, port, *args, **kwargs)
+        # literal IPs and local hostnames keep native behavior (validation is done per-request)
+        if _is_ip_literal(host):
+            return results
+        vetted = [r for r in results if is_public_ip(r[4][0])]
+        if not vetted:
+            raise SSRFError(f"主机 {host} 的解析结果全部位于内网/保留地址段，已拦截")
+        return vetted
+
+    socket.getaddrinfo = guarded_getaddrinfo
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
 # ---------- passwords ----------
 def hash_password(password: str) -> str:
     salt = os.urandom(16)
@@ -41,17 +96,6 @@ def decode_token(token: str) -> dict | None:
 
 
 # ---------- SSRF guard ----------
-PRIVATE_V4 = [ipaddress.ip_network(n) for n in (
-    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
-    "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16",
-    "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4",
-)]
-PRIVATE_V6 = [ipaddress.ip_network(n) for n in ("::1/128", "fc00::/7", "fe80::/10", "ff00::/8")]
-
-
-class SSRFError(Exception):
-    pass
-
 
 def validate_public_url(url: str) -> str:
     """Validate that a URL is a safe public HTTP(S) target. Raises SSRFError otherwise."""

@@ -7,7 +7,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 _tmpdir = tempfile.mkdtemp()
 os.environ["DATABASE_URL"] = f"sqlite:///{_tmpdir}/test.db"
+os.environ["ENV"] = "dev"          # 测试一律按开发环境（生产校验由专门的测试覆盖）
 os.environ["SCHEDULER_ENABLED"] = "false"
+os.environ["ROLE"] = "all"
 os.environ["ADMIN_PASSWORD"] = "test-admin-pass"
 
 import pytest  # noqa: E402

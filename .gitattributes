@@ -1,0 +1,2 @@
+# Force LF for shell scripts so OCI Ubuntu can execute them directly
+*.sh text eol=lf

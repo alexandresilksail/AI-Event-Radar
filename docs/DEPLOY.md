@@ -1,38 +1,72 @@
-# 部署文档
+# 部署文档（v1.1 生产架构）
 
-## 开发环境（Windows / Linux）
+目标环境：**OCI Always Free Ubuntu ARM64**（2 OCPU / 12GB，也可在 1 OCPU 试用）。
+镜像均提供 linux/arm64 与 linux/amd64 支持（python:3.13-slim / nginx:1.27-alpine / postgres:16-alpine）。
 
-```bash
-cd backend
-python -m venv .venv
-.venv\Scripts\activate            # Linux: source .venv/bin/activate
-pip install -r requirements.txt
-cp ../.env.example .env           # 修改 ADMIN_PASSWORD、JWT_SECRET
-python scripts/seed_sources.py
-uvicorn app.main:app --port 8000 --reload
-```
+## 前置条件
 
-前端：`cd frontend && npm install && npm run dev`（Vite 已配置 /api 代理到 8000 端口）。
+1. Docker Engine 24+ 与 compose 插件。
+2. 开放端口：仅 `HTTP_PORT`（默认 80）。PostgreSQL/API 仅内网。
+3. `.env` 已按 `.env.example` 填写（生产 ENV=production，缺项会被拒绝启动）。
 
-## 生产部署（Docker Compose + Nginx + PostgreSQL）
+## 一键部署
 
 ```bash
-cp .env.example .env
-# 必改：JWT_SECRET（≥32位随机）、ADMIN_PASSWORD、POSTGRES_PASSWORD
-docker compose up -d --build
+git clone https://github.com/alexandresilksail/AI-Event-Radar.git && cd AI-Event-Radar
+cp .env.example .env   # 填写全部必填
+bash scripts/deploy.sh
 ```
 
-- API：`http://<host>/`（Nginx → api:8000）
-- 控制台：`http://<host>/web/`
-- 数据持久化：`pgdata` 卷（数据库）、`appdata` 卷（SQLite 备用/文件）
+deploy.sh 会依次：检查 Docker → 检查环境变量 → 检查磁盘（≥2GB）→ 校验 compose →
+构建镜像 → 启动 db 并等待 healthy → 启动 api/web → 等待 /health/live 与 /api/health/ready
+→ 启动 worker → 校验状态。**任何一步失败立即中止，不会伪报成功。**
 
-## 数据库迁移
+## 服务与端口
 
-开发用 SQLite（`data/radar.db`）。切换 PostgreSQL：修改 `.env` 的 `DATABASE_URL` 后重启，
-`Base.metadata.create_all` 自动建表。表结构升级建议使用 Alembic（当前版本以
-create_all + 显式字段演进为主，字段变更前请备份数据库）。
+| 服务 | 镜像 | 公网暴露 | 说明 |
+|---|---|---|---|
+| web (nginx) | Dockerfile.web | `${HTTP_PORT:-80}` | 唯一公网入口：SPA + /api 反代 + 安全响应头 |
+| api | Dockerfile.api | 无（仅内网） | FastAPI，ROLE=api 不带调度器 |
+| worker | Dockerfile.api | 无 | `python -m app.worker`，DB 领导锁单调度器 |
+| db | postgres:16-alpine | 无 | 数据卷 pgdata |
 
-## 升级/重启
+## 日常运维
 
-- `docker compose restart api` — 调度器启动时从数据库恢复全部任务（重启恢复已实现并测试）。
-- 日志：`docker compose logs -f api`。
+```bash
+# 备份 / 恢复 / 体检
+bash scripts/backup.sh
+bash scripts/restore.sh backups/radar_YYYYmmdd_HHMMSS.sql.gz   # 需输入 RESTORE 确认
+bash scripts/healthcheck.sh
+
+# 查看日志
+docker compose -f docker-compose.prod.yml logs -f api|worker|web
+
+# 重启（worker 会从 DB 恢复全部采集任务）
+docker compose -f docker-compose.prod.yml restart
+
+# 更新版本
+git pull && docker compose -f docker-compose.prod.yml up -d --build
+```
+
+## ARM64 构建验证
+
+```bash
+docker buildx build --platform linux/arm64 -f Dockerfile.api -t radar-api:arm64 --load .
+docker buildx build --platform linux/arm64 -f Dockerfile.web -t radar-web:arm64 --load .
+docker run --rm radar-api:arm64 python -c "import app.main; print('api image ok')"
+docker run --rm radar-web:arm64 sh -c "ls /usr/share/nginx/html/index.html"
+```
+
+## 异地备份（免费资源不保证永久可用）
+
+1. 将 `backups/` 目录加入 cron 每日执行 `scripts/backup.sh`。
+2. 将备份文件同步到对象存储（如 OCI Object Storage 免费 10GB，或任意异地位置）：
+   ```cron
+   30 3 * * * cd /opt/AI-Event-Radar && bash scripts/backup.sh /shared-backups && rclone sync /shared-backups remote:radar-backups
+   ```
+3. 云资源回收/区域容量不足时，用最近备份在新实例上重新 deploy + restore 即可恢复。
+
+## HTTPS（可选）
+
+前端已声明安全响应头；在 web 前增加 TLS 终止（Caddy / cloudflared / OCI 负载均衡）。
+生产 ALLOWED_ORIGINS 应设置为你的 HTTPS 域名。

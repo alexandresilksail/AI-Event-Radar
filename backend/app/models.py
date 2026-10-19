@@ -202,3 +202,21 @@ class AuditLog(Base):
     action: Mapped[str] = mapped_column(String(100))
     detail: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class SchedulerLock(Base):
+    """Single active scheduler instance across API/Worker processes (DB-backed leader election)."""
+    __tablename__ = "scheduler_locks"
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    holder: Mapped[str] = mapped_column(String(128), default="")
+    acquired_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class SourceState(Base):
+    """Persisted per-source state that must survive restarts (e.g. change-detection content hash)."""
+    __tablename__ = "source_states"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source_id: Mapped[int] = mapped_column(ForeignKey("sources.id"), unique=True, index=True)
+    content_hash: Mapped[str] = mapped_column(String(64), default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)

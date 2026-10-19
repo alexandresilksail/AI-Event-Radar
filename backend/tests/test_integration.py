@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from app.models import Event, EventSource, Source
-from app.collectors.base import CollectedItem
+from app.collectors.base import CollectedItem, CollectorError
 
 
 def _rss_xml(items):
@@ -37,13 +37,11 @@ def source(db):
 
 
 def _mock_rss(monkeypatch, items):
-    # 仅测试环境放开 SSRF 域名校验（假域名 feed.example.com 无法真实解析）
-    monkeypatch.setattr("app.collectors.base.validate_public_url", lambda url: url)
-
-    def fake_get(url, **kw):
-        m = httpx.Response(200, content=_rss_xml(items).encode(), request=httpx.Request("GET", url))
-        return m
-    monkeypatch.setattr("app.collectors.base.httpx.get", fake_get)
+    """Patch the hardened safe_get (redirect/SSRF logic lives there) — no real network."""
+    def fake_safe_get(url, timeout=None, method="GET"):
+        return httpx.Response(200, content=_rss_xml(items).encode(),
+                               request=httpx.Request("GET", url))
+    monkeypatch.setattr("app.collectors.base.safe_get", fake_safe_get)
 
 
 class TestAuthAndSecurity:
@@ -141,8 +139,8 @@ class TestCrawlPipeline:
         db.commit()
         monkeypatch.setattr("app.collectors.base.validate_public_url", lambda url: url)
         def fake_get(url, **kw):
-            raise httpx.ConnectError("connection refused", request=httpx.Request("GET", url))
-        monkeypatch.setattr("app.collectors.base.httpx.get", fake_get)
+            raise CollectorError("请求失败: ConnectError: connection refused")
+        monkeypatch.setattr("app.collectors.base.safe_get", fake_get)
         r = client.post(f"/sources/{s.id}/trigger", headers=auth_headers)
         assert r.json()["status"] == "failed" and "请求失败" in r.json()["error"]
         logs = client.get("/crawl-logs", params={"status": "failed"}).json()
