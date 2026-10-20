@@ -3,7 +3,7 @@
 7×24 小时持续监控互联网公开渠道，自动发现、识别、去重、核实并推送 AI 相关活动预告。
 **所有仪表盘数字均来自真实数据库，系统不生成任何模拟/假数据。**
 
-## 架构（v1.2 生产架构）
+## 架构（v1.3 生产架构）
 
 ```
                 ┌────────────┐
@@ -79,7 +79,8 @@ bash scripts/deploy.sh      # 检查→构建→迁移→启动→健康检查�
 ai-event-radar/
 ├── backend/
 │   ├── app/
-│   │   ├── main.py            # FastAPI 入口 + 生产配置校验 + 迁移初始化
+│   │   ├── migrate.py          # 一次性迁移入口：跨进程互斥 + 僵死守卫接管（生产由独立 migrate 服务执行）
+│   ├── main.py            # FastAPI 入口 + 生产配置校验（AUTO_MIGRATE=false 时不自动迁移）
 │   │   ├── worker.py          # 独立采集进程入口（python -m app.worker）
 │   │   ├── config.py          # .env + 生产启动安全校验（P0）
 │   │   ├── security.py        # PBKDF2 + JWT + SSRF 逐跳校验 + 守护型 DNS
@@ -89,7 +90,7 @@ ai-event-radar/
 │   │   ├── routers/           # auth / sources / events / tasks / monitor / notifications / health
 │   │   ├── seed.py            # 幂等种子数据源（python -m app.seed）
 │   │   └── alembic 相关迁移在 backend/alembic/
-│   └── tests/                 # 100 项测试 + 2 项真实 E2E
+│   └── tests/                 # 166 项测试 + 2 项真实 E2E
 ├── frontend/                  # React 18 + TS + Vite，12 页面（含详情页）
 ├── scripts/                   # deploy / backup / restore / healthcheck
 ├── docs/                      # API / DEPLOY / ACCEPTANCE / SECURITY / LIMITATIONS / TROUBLESHOOTING
@@ -99,16 +100,19 @@ ai-event-radar/
 
 ## 安全要点（详见 docs/SECURITY.md）
 
-- 生产启动校验：默认 JWT_SECRET / 弱管理员密码 / SQLite / 通配 CORS 一律**拒绝启动**。
+- 生产启动校验：默认 JWT_SECRET / 弱管理员密码 / SQLite / 通配符 CORS / 缺失 ALLOWED_ORIGINS 一律**拒绝启动**。
 - 管理员初始化幂等：只建号，**永不重置已存在密码**；支持凭密码修改与 ADMIN_RESET_TOKEN 重置。
-- SSRF：拒绝跳内网、云元数据、非 http(s)、重定向超限；DNS 解析后过滤；响应 5MB 上限。
+- SSRF（v1.3 加固）：IPv4/IPv6 全地址族分类（环回/私有/链路本地/组播/保留/IPv4 映射）；DNS 多地址**任一非公网即拒绝**（防混合记录与 rebinding）；逐跳重定向校验；守护型解析器在连接层二次校验；端口白名单；响应 5MB 上限 + 超时 + 重定向次数上限。
+- 调度安全：数据库租约锁（原子 CAS + lease_version fencing），租约丢失即停调度，旧 Leader 无法用过期身份提交；心跳线程随 Worker 退出。
+- 数据库凭据：`encode_db_url` 先解码再精确编码一次（幂等），不再出现 `%40 → %2540` 双重编码；特殊字符密码（@ : / % + # 空格）真实连接测试覆盖。
+- 迁移安全：生产迁移由独立一次性 `migrate` 服务执行（compose 保证 DB 健康→迁移成功→API/Worker 启动）；跨进程互斥 + 僵死 pid 守卫接管，API/Worker 启动不再竞争迁移。
 - 密钥只存服务端 .env；通知凭证在 API 打码；敏感配置禁止写入系统设置接口。
 
 ## 测试
 
 ```bash
 cd backend
-pytest tests/ -m "not real_network"   # 100 项：单元/集成/安全/迁移/启动配置/SSRF 重定向/数据源管理/任务管理
+pytest tests/ -m "not real_network"   # 166 项：单元/集成/安全/迁移/启动配置/SSRF/调度租约/DB编码/健康检查
 pytest tests/ -m real_network         # 2 项：真实公开源端到端采集
 ```
 

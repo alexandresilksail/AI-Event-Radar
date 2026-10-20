@@ -40,8 +40,9 @@ log "6/9 启动数据库并等待健康"
 $COMPOSE up -d db
 $COMPOSE ps db | grep -q healthy || fail "数据库未进入 healthy 状态：$COMPOSE ps db"
 
-log "7/9 启动 API（内含 schema 迁移）与 Web"
+log "7/9 启动 API（先由独立 migrate 服务执行一次性 schema 迁移）与 Web"
 $COMPOSE up -d api web
+$COMPOSE ps migrate | grep -q "exited (0)" || fail "迁移服务未成功完成：$COMPOSE logs migrate"
 
 log "8/9 等待健康检查通过"
 base="http://localhost:${HTTP_PORT:-80}"

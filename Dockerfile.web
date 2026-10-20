@@ -11,5 +11,8 @@ FROM nginx:1.27-alpine AS runtime
 COPY --from=build /web/dist /usr/share/nginx/html
 COPY nginx.prod.conf /etc/nginx/conf.d/default.conf
 EXPOSE 80
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD wget -qO- http://localhost/health/live || exit 1
+# Dedicated no-fallback location: unlike /health/live, /nginx-health never
+# resolves to index.html via SPA try_files, so a 200 here means nginx itself
+# is really serving (no false-positive from SPA fallback).
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD wget -qO- http://localhost/nginx-health || exit 1
 CMD ["nginx", "-g", "daemon off;"]

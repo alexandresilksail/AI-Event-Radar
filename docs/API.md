@@ -1,4 +1,4 @@
-# API 文档（v1.2 更新）
+# API 文档（v1.3 更新）
 
 交互式文档：启动后访问 `http://<host>/docs`。
 
@@ -12,10 +12,14 @@
 | POST /auth/login | 登录获取 JWT |
 | POST /auth/change-password | 已登录修改密码（校验旧密码，新密码 ≥10 位） |
 | POST /auth/reset-password | 安全重置（需 .env 配置 ADMIN_RESET_TOKEN，未配置返回 403） |
-| GET /health/live | 存活探针（无副作用，Docker HEALTHCHECK 用） |
-| GET /health/ready | 就绪探针（检查数据库；不可用返回 503，不伪装 ready） |
+| GET /health/live | 存活探针：仅证明进程活着（无副作用，不做业务判断） |
+| GET /health/ready | 就绪探针：检查数据库连通；不可用返回 503，不伪装 ready |
+| GET /health/scheduler | 调度器健康：数据库租约是否有效（leader_elected/lease_valid/ok/lease_version），无有效租约时 ok=false |
 | GET /status | 含 role、leader_holder、running_task_source_ids 的真实状态 |
 | GET /health | 旧版兼容健康检查 |
+
+> Worker 容器另在 `WORKER_HEALTH_PORT`（默认 8001，仅监听内部网络）暴露同款 `/health/live|ready|scheduler`，
+> 供容器编排判断 Worker 进程与调度状态。
 
 ## 完整端点
 

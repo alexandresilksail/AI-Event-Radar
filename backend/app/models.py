@@ -218,12 +218,17 @@ class AuditLog(Base):
 
 
 class SchedulerLock(Base):
-    """Single active scheduler instance across API/Worker processes (DB-backed leader election)."""
+    """Single active scheduler instance across API/Worker processes (DB-backed leader election).
+
+    lease_version is a fencing token: it increases on every acquisition, so an
+    old leader that lost the lease (or was taken over) can be detected by any
+    job before it performs side effects."""
     __tablename__ = "scheduler_locks"
     id: Mapped[int] = mapped_column(primary_key=True, default=1)
     holder: Mapped[str] = mapped_column(String(128), default="")
     acquired_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     heartbeat_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    lease_version: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class SourceState(Base):

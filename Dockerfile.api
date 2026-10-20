@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1
-# API image: FastAPI web role. Scheduler runs in the separate worker service.
+# API image: FastAPI. ROLE selects the process (api=web only, worker=scheduler).
+# Migrations are NOT run here in production: the dedicated one-shot `migrate`
+# service owns schema changes; api/worker run with AUTO_MIGRATE=false.
 FROM python:3.13-slim-bookworm AS builder
 WORKDIR /w
 COPY backend/requirements.txt .
@@ -17,6 +19,10 @@ COPY backend/alembic ./alembic
 RUN mkdir -p /app/data && useradd -r -u 10001 radar && chown -R radar /app
 USER radar
 ENV ROLE=api
-EXPOSE 8000
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD curl -fsS http://localhost:8000/health/live || exit 1
-CMD ["sh", "-c", "cd /app && python -c 'from app.main import migrate_or_init; migrate_or_init()' && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+ENV AUTO_MIGRATE=false
+EXPOSE 8000 8001
+# Role-aware liveness: api serves :8000, worker serves its embedded health
+# server on :8001 (both are simple process-alive checks — dependency checks
+# live at /health/ready and /health/scheduler, used by orchestration/monitoring).
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD sh -c 'if [ "$ROLE" = worker ]; then curl -fsS http://localhost:8001/health/live || exit 1; else curl -fsS http://localhost:8000/health/live || exit 1; fi'
+CMD ["sh", "-c", "if [ \"$ROLE\" = worker ]; then exec python -m app.worker; else exec uvicorn app.main:app --host 0.0.0.0 --port 8000; fi"]

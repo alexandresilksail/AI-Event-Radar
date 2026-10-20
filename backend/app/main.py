@@ -2,9 +2,10 @@
 
 Startup hardening:
 - Production refuses to boot with unsafe config (see config.validate_production_config).
-- Database schema: alembic upgrade head on fresh DBs; legacy DBs (created by
-  create_all, no alembic_version) are topped up with any missing tables and stamped.
-- Scheduler runs only in ROLE=worker|all, guarded by a DB leader lock.
+- Database schema in production is owned by the dedicated one-shot migrate
+  service (AUTO_MIGRATE=false there): API replicas never race on migrations.
+  In dev, AUTO_MIGRATE defaults to true for convenience.
+- Scheduler runs only in ROLE=worker|all, guarded by a DB leader lease.
 """
 import logging
 from contextlib import asynccontextmanager
@@ -15,7 +16,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import inspect, text
 
-from .config import encode_db_url, is_production, settings, validate_production_config
+from .config import (auto_migrate_enabled, encode_db_url, is_production, settings,
+                     validate_production_config)
 from .database import Base, SessionLocal, engine
 from .routers import auth, events, health, monitor, notifications, sources, tasks
 from .routers.auth import ensure_default_admin
@@ -85,7 +87,10 @@ def migrate_or_init() -> None:
 async def lifespan(app: FastAPI):
     install_guarded_resolver()  # DNS-level SSRF guard for all outbound connections
     validate_production_config(settings)  # fail fast on unsafe production config
-    migrate_or_init()
+    if auto_migrate_enabled(settings):
+        migrate_or_init()  # dev convenience only; production uses the migrate service
+    else:
+        logging.info("AUTO_MIGRATE=false：跳过启动迁移（由独立 migrate 服务负责）")
     db = SessionLocal()
     try:
         ensure_default_admin(db)
