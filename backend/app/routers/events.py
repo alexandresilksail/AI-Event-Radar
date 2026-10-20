@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import PlainTextResponse
-from sqlalchemy import func, or_
+from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from ..database import get_db
@@ -162,19 +162,51 @@ def dashboard_stats(db: Session = Depends(get_db)):
                            func.sum(CrawlLog.new_count))
                   .filter(CrawlLog.started_at >= now - timedelta(days=1))
                   .group_by("d").all())
+    trend7_rows = (db.query(func.date(CrawlLog.started_at).label("d"),
+                            func.count(CrawlLog.id),
+                            func.sum(CrawlLog.new_count),
+                            func.sum(case((CrawlLog.status == "failed", 1), else_=0)))
+                   .filter(CrawlLog.started_at >= now - timedelta(days=7))
+                   .group_by("d").all())
     last_success = (db.query(CrawlLog.started_at)
                     .filter(CrawlLog.status == "success")
                     .order_by(CrawlLog.started_at.desc()).first())
+    today_logs = (db.query(CrawlLog)
+                  .filter(CrawlLog.started_at >= today_start).all())
+    today_finished = [l for l in today_logs if l.status in ("success", "partial", "failed")]
+    today_success = [l for l in today_finished if l.status in ("success", "partial")]
+    today_durations = [(l.finished_at - l.started_at).total_seconds() * 1000
+                       for l in today_finished if l.finished_at and l.started_at]
+    all_sources = db.query(Source).filter(Source.deleted_at.is_(None)).all()
+    health_breakdown = {"healthy": 0, "failing": 0, "paused": 0, "never": 0}
+    for s in all_sources:
+        if not s.enabled:
+            health_breakdown["paused"] += 1
+        elif s.consecutive_failures > 0 or s.status == "failing":
+            health_breakdown["failing"] += 1
+        elif s.last_success_at is None:
+            health_breakdown["never"] += 1
+        else:
+            health_breakdown["healthy"] += 1
     sch = sched.scheduler_status()
     return {
         "new_events_today": new_today,
-        "total_sources": total_sources,
+        "total_sources": len(all_sources),
         "healthy_sources": healthy,
         "failing_sources": failing,
         "pending_verify_events": pending_verify,
         "upcoming_7d": [_event_dict(e, db) for e in upcoming],
         "crawl_trend_24h": [{"date": str(r[0]), "tasks": r[1], "new_events": int(r[2] or 0)}
                             for r in trend_rows],
+        "crawl_trend_7d": [{"date": str(r[0]), "tasks": r[1], "new_events": int(r[2] or 0),
+                            "failed": int(r[3] or 0)} for r in trend7_rows],
+        "today_crawls": {
+            "total": len(today_finished),
+            "succeeded": len(today_success),
+            "success_rate": round(len(today_success) / len(today_finished), 4) if today_finished else None,
+            "avg_duration_ms": round(sum(today_durations) / len(today_durations)) if today_durations else None,
+        },
+        "source_health": health_breakdown,
         "last_success_crawl_at": last_success[0] if last_success else None,
         "system": {"scheduler_running": sch["scheduler_running"],
                    "job_count": sch["job_count"],
@@ -232,8 +264,8 @@ def analysis_stats(db: Session = Depends(get_db)):
     }
 
 
-@router.get("/health", response_class=PlainTextResponse)
-def health(db: Session = Depends(get_db)):
+@router.get("/health", response_class=PlainTextResponse, include_in_schema=False)
+def text_health(db: Session = Depends(get_db)):
     from sqlalchemy import text as sql
     try:
         db.execute(sql("SELECT 1"))

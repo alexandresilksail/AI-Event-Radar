@@ -1,4 +1,5 @@
 """Unit tests: SSRF guard, URL/name normalization, rule-based extraction, date parsing."""
+import socket
 from datetime import datetime
 
 import pytest
@@ -31,6 +32,12 @@ class TestSSRF:
             validate_public_url("http://127.0.0.1.nip.io/")
 
     def test_allows_public(self):
+        # 公网域名是否放行取决于真实 DNS。沙箱 DNS 不可用时明确 SKIP（环境问题），
+        # 若解析成功仍被策略拒绝则如实 FAIL——不伪造通过。
+        try:
+            socket.getaddrinfo("news.mit.edu", None)
+        except OSError as e:
+            pytest.skip(f"沙箱 DNS 不可用，无法验证公网域名放行: {e}")
         assert validate_public_url("https://news.mit.edu/rss") == "https://news.mit.edu/rss"
 
 

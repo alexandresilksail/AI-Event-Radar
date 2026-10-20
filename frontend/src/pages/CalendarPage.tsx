@@ -1,15 +1,20 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { api } from '../api'
+import { Empty, ErrorBox, PageHead } from '../components/ui'
 
 export default function CalendarPage() {
   const [view, setView] = useState<'month' | 'week'>('month')
   const [anchor, setAnchor] = useState(() => new Date().toISOString().slice(0, 10))
   const [items, setItems] = useState<any[]>([])
   const [range, setRange] = useState<[string, string]>(['', ''])
+  const [err, setErr] = useState('')
 
   const load = useCallback(() => {
-    api(`/calendar?view=${view}&date=${anchor}`).then(r => { setItems(r.items); setRange(r.range) })
+    setErr('')
+    api(`/calendar?view=${view}&date=${anchor}`)
+      .then(r => { setItems(r.items); setRange(r.range) })
+      .catch(e => setErr(e.message))
   }, [view, anchor])
   useEffect(() => { load() }, [load])
 
@@ -29,32 +34,49 @@ export default function CalendarPage() {
     const d = new Date(anchor); d.setDate(d.getDate() + n * (view === 'month' ? 28 : 7))
     setAnchor(d.toISOString().slice(0, 10))
   }
+  const today = new Date().toISOString().slice(0, 10)
+  const monthOf = (range[1] || anchor).slice(0, 7)
 
   return (
     <div>
-      <h1 className="page-title">日历视图</h1>
+      <PageHead title="🗓 日历视图" desc={`范围：${range[0] || '—'} ~ ${range[1] || '—'} · 仅显示已采集到的活动`} />
       <div className="filters">
         <select value={view} onChange={e => setView(e.target.value as any)}>
           <option value="month">月视图</option><option value="week">周视图</option>
         </select>
-        <button onClick={() => shift(-1)}>← 上一{view === 'month' ? '月' : '周'}</button>
+        <button className="btn sm" onClick={() => shift(-1)}>← 上一{view === 'month' ? '月' : '周'}</button>
         <input type="date" value={anchor} onChange={e => setAnchor(e.target.value)} />
-        <button onClick={() => shift(1)}>下一{view === 'month' ? '月' : '周'} →</button>
-        <span className="muted" style={{ padding: 6 }}>范围：{range[0]} ~ {range[1]}</span>
+        <button className="btn sm" onClick={() => shift(1)}>下一{view === 'month' ? '月' : '周'} →</button>
+        <button className="btn sm ghost" onClick={() => setAnchor(today)}>回到今天</button>
       </div>
-      <div className="calendar-grid">
-        {['一', '二', '三', '四', '五', '六', '日'].map(w => (
-          <div key={w} className="muted" style={{ textAlign: 'center', fontWeight: 700 }}>周{w}</div>
-        ))}
-        {cells.map(c => (
-          <div className="cal-cell" key={c.date} style={{ opacity: c.date === new Date().toISOString().slice(0, 10) ? 1 : 0.92, border: c.date === anchor ? '2px solid var(--primary)' : undefined }}>
-            <div className="day">{Number(c.date.slice(8))}</div>
-            {c.events.map(e => (
-              <Link key={e.id} to={`/events/${e.id}`} className="cal-ev" title={e.name}>{e.name}</Link>
-            ))}
-          </div>
-        ))}
+
+      {err && <ErrorBox err={err} onRetry={load} />}
+
+      <div className="cal-head">
+        {['一', '二', '三', '四', '五', '六', '日'].map(w => <div key={w}>周{w}</div>)}
       </div>
+      <div className="cal-grid">
+        {cells.map(c => {
+          const out = view === 'month' && !c.date.startsWith(monthOf)
+          return (
+            <div key={c.date}
+              className={`cal-cell ${c.date === today ? 'today' : ''} ${out ? 'out' : ''}`}>
+              <div className="day">{Number(c.date.slice(8))}</div>
+              {c.events.map(e => (
+                <Link key={e.id} to={`/events/${e.id}`} className={`cal-ev ${e.is_free ? 'free' : ''}`}
+                  title={e.name}>{e.name}</Link>
+              ))}
+            </div>
+          )
+        })}
+      </div>
+
+      {items.length === 0 && (
+        <div style={{ marginTop: 16 }}>
+          <Empty icon="🗓" title="该时间范围内暂无活动"
+            hint="采集到含日期的活动后会自动出现在日历中。" />
+        </div>
+      )}
     </div>
   )
 }

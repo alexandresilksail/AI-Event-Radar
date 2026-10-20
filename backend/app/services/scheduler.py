@@ -44,7 +44,7 @@ def _crawl_job(source_id: int) -> None:
         try:
             source = db.get(Source, source_id)
             if source and source.enabled:
-                create_task_and_crawl(db, source)
+                create_task_and_crawl(db, source, trigger="scheduled")
         finally:
             db.close()
     except Exception as e:

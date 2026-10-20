@@ -12,7 +12,8 @@ import pytest
 from app.collectors import safe_get, CollectorError, ChangeDetectionCollector, HTMLCollector
 from app.models import SchedulerLock, Source, User
 from app.security import (SSRFError, is_public_ip, validate_public_url,
-                          _orig_getaddrinfo, install_guarded_resolver)
+                          _orig_getaddrinfo, install_guarded_resolver,
+                          uninstall_guarded_resolver)
 
 BACKEND = Path(__file__).resolve().parent.parent
 
@@ -201,11 +202,14 @@ class TestSSRFRedirects:
         assert vetted == []  # localhost -> all private -> guarded resolver would raise
 
     def test_resolver_install_is_idempotent(self):
-        install_guarded_resolver()
-        import socket
-        first = socket.getaddrinfo
-        install_guarded_resolver()
-        assert socket.getaddrinfo is first
+        try:
+            install_guarded_resolver()
+            import socket
+            first = socket.getaddrinfo
+            install_guarded_resolver()
+            assert socket.getaddrinfo is first
+        finally:
+            uninstall_guarded_resolver()  # 不污染进程内其他测试的 DNS 行为
 
 
 # ---------- change detection persistence ----------

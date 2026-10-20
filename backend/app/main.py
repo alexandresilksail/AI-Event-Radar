@@ -17,7 +17,7 @@ from sqlalchemy import inspect, text
 
 from .config import encode_db_url, is_production, settings, validate_production_config
 from .database import Base, SessionLocal, engine
-from .routers import auth, events, health, notifications, sources
+from .routers import auth, events, health, monitor, notifications, sources, tasks
 from .routers.auth import ensure_default_admin
 from .security import install_guarded_resolver
 from .services.pipeline import refresh_event_status
@@ -46,8 +46,22 @@ def _alembic_cfg() -> Config:
     return cfg
 
 
+def _schema_matches_models() -> bool:
+    """True when every current model table+column already exists (e.g. legacy DBs topped up by create_all)."""
+    insp = inspect(engine)
+    existing = set(insp.get_table_names())
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing:
+            return False
+        cols = {c["name"] for c in insp.get_columns(table.name)}
+        if any(c.name not in cols for c in table.columns):
+            return False
+    return True
+
+
 def migrate_or_init() -> None:
-    """Fresh DB: run migrations. Legacy DB without alembic_version: add missing tables, stamp baseline."""
+    """Fresh DB: run migrations. Legacy DB without alembic_version: add missing tables, stamp baseline,
+    then apply incremental migrations (data preserved)."""
     insp = inspect(engine)
     has_tables = bool(insp.get_table_names())
     stamped = "alembic_version" in insp.get_table_names()
@@ -57,9 +71,14 @@ def migrate_or_init() -> None:
     if not has_tables:
         command.upgrade(_alembic_cfg(), "head")
         return
-    # legacy DB: ensure every current table exists, then stamp baseline (data preserved)
+    # legacy DB: ensure every current table exists, then bring it to head
     Base.metadata.create_all(engine)
+    if _schema_matches_models():
+        # schema already includes the new columns (create_all-style DB) — just record the version
+        command.stamp(_alembic_cfg(), "head")
+        return
     command.stamp(_alembic_cfg(), "8bcc2e0aae52")
+    command.upgrade(_alembic_cfg(), "head")
 
 
 @asynccontextmanager
@@ -85,7 +104,7 @@ async def lifespan(app: FastAPI):
     sched.stop_scheduler()
 
 
-app = FastAPI(title=settings.APP_NAME, version="1.1.0", lifespan=lifespan)
+app = FastAPI(title=settings.APP_NAME, version="1.2.0", lifespan=lifespan)
 
 app.add_middleware(CORSMiddleware, allow_origins=allowed_origins(),
                    allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -95,6 +114,8 @@ app.include_router(sources.router)
 app.include_router(events.router)
 app.include_router(health.router)
 app.include_router(notifications.router)
+app.include_router(tasks.router)
+app.include_router(monitor.router)
 
 
 @app.get("/status")

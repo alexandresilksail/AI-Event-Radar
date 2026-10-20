@@ -3,7 +3,7 @@
 7×24 小时持续监控互联网公开渠道，自动发现、识别、去重、核实并推送 AI 相关活动预告。
 **所有仪表盘数字均来自真实数据库，系统不生成任何模拟/假数据。**
 
-## 架构（v1.1 生产架构）
+## 架构（v1.2 生产架构）
 
 ```
                 ┌────────────┐
@@ -28,6 +28,16 @@
   worker 重启后从 sources 表恢复全部任务；API 重启不影响 worker。
 - **web**：多阶段构建的静态前端，由 Nginx 直接提供（运行时不执行 npm install）。
 - SSRF：所有出站请求逐跳校验 + 守护型 DNS 解析器（连接时也过滤内网解析结果）。
+
+## 功能总览（v1.2）
+
+**前端控制台（深色 AI 科技风，8 个页面）**：首页概览 · 活动情报中心 · 活动详情 · 日历视图 ·
+数据源管理（筛选/搜索/分页/增改/启停/测试/立即采集/软删除确认）· 数据源详情（趋势/原始内容/变更记录）·
+采集任务日志（状态筛选/任务详情时间线/失败重试）· 系统监控 · 通知规则 · 系统设置（修改密码）。
+全站统一设计令牌（styles.css CSS 变量），骨架屏/空态/错误态/Toast 完整。
+
+**后端 API（FastAPI）**：数据源完整生命周期管理、采集任务管理（pending/running/success/partial/failed
+六态 + trigger/retry_of/duration/counts 全字段）、系统监控聚合、通知规则、活动情报、统计仪表盘。
 
 ## 数据源插件（全部已实现并测试）
 
@@ -76,11 +86,11 @@ ai-event-radar/
 │   │   ├── models.py          # 15 张表（含 scheduler_locks / source_states）
 │   │   ├── collectors/        # rss / html / api / sitemap / change_detection / search
 │   │   ├── services/          # pipeline / extraction / dedup / notifier / discovery / scheduler(DB锁)
-│   │   ├── routers/           # auth / sources / events / notifications / health
+│   │   ├── routers/           # auth / sources / events / tasks / monitor / notifications / health
 │   │   ├── seed.py            # 幂等种子数据源（python -m app.seed）
 │   │   └── alembic 相关迁移在 backend/alembic/
-│   └── tests/                 # 82 项测试 + 2 项真实 E2E
-├── frontend/                  # React 18 + TS + Vite，8 页面
+│   └── tests/                 # 100 项测试 + 2 项真实 E2E
+├── frontend/                  # React 18 + TS + Vite，12 页面（含详情页）
 ├── scripts/                   # deploy / backup / restore / healthcheck
 ├── docs/                      # API / DEPLOY / ACCEPTANCE / SECURITY / LIMITATIONS / TROUBLESHOOTING
 ├── Dockerfile.api / Dockerfile.web / docker-compose.prod.yml / nginx.prod.conf
@@ -98,7 +108,7 @@ ai-event-radar/
 
 ```bash
 cd backend
-pytest tests/ -m "not real_network"   # 82 项：单元/集成/安全/迁移/启动配置/SSRF 重定向
+pytest tests/ -m "not real_network"   # 100 项：单元/集成/安全/迁移/启动配置/SSRF 重定向/数据源管理/任务管理
 pytest tests/ -m real_network         # 2 项：真实公开源端到端采集
 ```
 

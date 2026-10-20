@@ -8,7 +8,10 @@ import Events from './pages/Events'
 import EventDetail from './pages/EventDetail'
 import CalendarPage from './pages/CalendarPage'
 import Sources from './pages/Sources'
-import Logs from './pages/Logs'
+import SourceDetail from './pages/SourceDetail'
+import Tasks from './pages/Tasks'
+import TaskDetail from './pages/TaskDetail'
+import Monitor from './pages/Monitor'
 import Notifications from './pages/Notifications'
 import SettingsPage from './pages/SettingsPage'
 import './styles.css'
@@ -28,9 +31,13 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
         <Route path="events/:id" element={<EventDetail />} />
         <Route path="calendar" element={<CalendarPage />} />
         <Route path="sources" element={<Sources />} />
-        <Route path="logs" element={<Logs />} />
+        <Route path="sources/:id" element={<SourceDetail />} />
+        <Route path="tasks" element={<Tasks />} />
+        <Route path="tasks/:id" element={<TaskDetail />} />
+        <Route path="monitor" element={<Monitor />} />
         <Route path="notifications" element={<Notifications />} />
         <Route path="settings" element={<SettingsPage />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>
   </HashRouter>

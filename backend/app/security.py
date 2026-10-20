@@ -58,6 +58,16 @@ def install_guarded_resolver() -> None:
     socket.getaddrinfo = guarded_getaddrinfo
 
 
+def uninstall_guarded_resolver() -> None:
+    """Restore the native resolver. Production keeps it installed for the process
+    lifetime; tests use this to avoid polluting process-wide state."""
+    global _RESOLVER_INSTALLED
+    if not _RESOLVER_INSTALLED:
+        return
+    socket.getaddrinfo = _orig_getaddrinfo
+    _RESOLVER_INSTALLED = False
+
+
 def _is_ip_literal(host: str) -> bool:
     try:
         ipaddress.ip_address(host)

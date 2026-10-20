@@ -33,14 +33,20 @@ class Source(Base):
     frequency_minutes: Mapped[int] = mapped_column(Integer, default=60)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     status: Mapped[str] = mapped_column(String(24), default="active")  # candidate|active|paused|failing
+    topics: Mapped[str] = mapped_column(String(500), default="")        # 监控主题/关键词（逗号分隔）
+    timezone: Mapped[str] = mapped_column(String(64), default="")       # 可选时区备注
+    note: Mapped[str] = mapped_column(Text, default="")                 # 备注
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_failure_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_crawled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)   # 最近一次采集（无论成败）
+    last_crawl_status: Mapped[str] = mapped_column(String(16), default="")             # success|partial|failed|""
     last_error: Mapped[str] = mapped_column(Text, default="")
     consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
     last_item_count: Mapped[int] = mapped_column(Integer, default=0)
     total_events_found: Mapped[int] = mapped_column(Integer, default=0)
     compliance_note: Mapped[str] = mapped_column(Text, default="")
     discovery_path: Mapped[str] = mapped_column(Text, default="")  # how this source was discovered
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # soft delete
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
@@ -51,10 +57,17 @@ class CrawlTask(Base):
     __tablename__ = "crawl_tasks"
     id: Mapped[int] = mapped_column(primary_key=True)
     source_id: Mapped[int] = mapped_column(ForeignKey("sources.id"))
-    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending|running|success|failed
+    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending|running|success|partial|failed
+    trigger: Mapped[str] = mapped_column(String(16), default="manual")  # manual|scheduled|retry|seed
+    retry_of: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 原任务 ID（重试关联）
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    found_count: Mapped[int] = mapped_column(Integer, default=0)
+    new_count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_count: Mapped[int] = mapped_column(Integer, default=0)
+    duplicate_count: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str] = mapped_column(Text, default="")
 
 
