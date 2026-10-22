@@ -2,7 +2,7 @@
 
 **审计日期**：2026-10-22
 **被审计 Git commit**：`a4d7124ff2635d14d9b2a122e2061beaa870c961`（审计基线）
-**修复后 commit**：见 `docs/RELEASE_AUDIT.md` §7
+**修复后 commit**：`3cbf48292bf3aacd08d008d8a91f86d25fcefc6d`
 **审计范围**：后端应用层 / 数据库连接与调度器 / 生产部署配置 / 第三方依赖
 **配套文档**：`TEST_REPORT.md`（逐条测试证据）、`RELEASE_AUDIT.md`（放行结论）
 **安全结论**：**代码层面通过；2 项部署环境验证未完成（NOT VERIFIED，见 §11）**

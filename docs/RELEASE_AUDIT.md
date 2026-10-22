@@ -2,7 +2,7 @@
 
 **审计版本**：v1.5
 **被审计 Git commit**：`a4d7124ff2635d14d9b2a122e2061beaa870c961`（审计基线，v1.4 已推送状态）
-**修复后 commit**：见 §7
+**修复后 commit**：`3cbf48292bf3aacd08d008d8a91f86d25fcefc6d`
 **审计日期**：2026-10-22
 **审计环境**：Windows 10 (10.0.19045) / Python 3.13.12 / pytest / Node v22.22.2 / npm 10.9.7 / psycopg 3.2.13 (libpq 160009)
 **审计范围**：数据库凭据处理 / SSRF 地址判定 / 调度器租约 fencing / 生产部署配置与脚本 / 干净环境构建 / 迁移与启动 / 依赖供应链
@@ -326,7 +326,7 @@ cd backend && ../.venv/Scripts/python.exe release_smoke.py
 | 项 | 值 |
 |---|---|
 | 审计基线 commit | `a4d7124ff2635d14d9b2a122e2061beaa870c961` |
-| 修复 commit | `__RELEASE_COMMIT__` |
+| 修复 commit | `3cbf48292bf3aacd08d008d8a91f86d25fcefc6d` |
 | 远端 | `git@github.com:alexandresilksail/AI-Event-Radar.git` |
 | 分支 | `main` |
 | 推送后校验 | `git rev-parse HEAD` == `git rev-parse origin/main` → 一致 |

@@ -2,7 +2,7 @@
 
 **执行日期**：2026-10-22
 **被审计 Git commit**：`a4d7124ff2635d14d9b2a122e2061beaa870c961`（审计基线，即本轮修复前的 `main`）
-**修复后 commit**：`见 §8「提交与推送」`
+**修复后 commit**：`3cbf48292bf3aacd08d008d8a91f86d25fcefc6d`
 **环境**：Windows 10 (10.0.19045) / Python 3.13.12 / pytest / Node v22.22.2 / npm 10.9.7 / psycopg 3.2.13 (libpq 160009)
 **工作目录**：`C:\Users\Administrator\WorkBuddy\2026-10-19-16-34-12\ai-event-radar`
 
