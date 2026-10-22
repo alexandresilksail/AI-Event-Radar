@@ -45,7 +45,10 @@ COUNTRY_HINTS = [("中国", CITY_LIST_ZH + ["中国", "China"]), ("美国", ["�
 
 DATE_PATTERNS = [
     r"(\d{4})年(\d{1,2})月(\d{1,2})日(?:\s*[—–\-至到~]\s*(?:(\d{4})年)?(\d{1,2})月(\d{1,2})日)?",
-    r"(\d{4})-(\d{1,2})-(\d{1,2})(?:\s*[—–\-至到~]\s*(?:(\d{4})-(\d{1,2})-(\d{1,2})))?",
+    # ISO dates. The range separator may be a dash, tilde, CJK dash, or the
+    # English word "to" (e.g. "2026-12-05 to 2026-12-06"). `to\b` is listed
+    # first so it wins over the bare dash alternative.
+    r"(\d{4})-(\d{1,2})-(\d{1,2})(?:\s*(?:to\b|[—–至到~]|-)\s*(?:(\d{4})-(\d{1,2})-(\d{1,2})))?",
 ]
 FREE_HINTS = ["免费", "free admission", "free entry", "no charge", "公益"]
 PAID_HINTS = ["门票", "票价", "注册费", "报名费", "ticket", "registration fee", "pricing"]

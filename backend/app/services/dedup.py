@@ -11,7 +11,7 @@ from difflib import SequenceMatcher
 
 from sqlalchemy.orm import Session
 
-from ..models import Event, EventSource
+from ..models import Event, EventSource, utcnow
 
 
 def normalize_url(url: str) -> str:
@@ -36,7 +36,13 @@ def find_duplicate(db: Session, fields: dict, url: str, threshold: float = 0.82)
     # Layer 1: URL
     norm = normalize_url(url)
     if norm:
-        es = db.query(EventSource).filter(EventSource.url.contains(norm.split("/")[0])).all()
+        # Narrow the candidate set by host (the first path segment of the
+        # normalized URL) before comparing exactly. The SQL filter is only a
+        # PRE-filter — the exact normalized comparison below is what decides
+        # the match — so a broad `contains(host)` is acceptable here and
+        # avoids schema-specific prefix matching.
+        host = norm.split("/")[0]
+        es = db.query(EventSource).filter(EventSource.url.contains(host)).all()
         for row in es:
             if normalize_url(row.url) == norm:
                 return db.get(Event, row.event_id)
@@ -83,24 +89,55 @@ def grade_confidence(event: Event, source_is_official: bool = False) -> str:
 
 def merge_event(db: Session, existing: Event, fields: dict, url: str, title: str,
                 source_id: int) -> tuple[Event, list[str]]:
-    """Update existing event with new info; keep full history; never delete."""
+    """Update existing event with new info; keep full history; never delete.
+
+    Field-update policy:
+    - A new value that is unknown/empty NEVER overwrites a confirmed value.
+    - An empty/unknown old value is filled in by a confirmed new value.
+    - A confirmed new value that DIFFERS from a confirmed old value is a real
+      change. It is applied ONLY when it comes from the SAME publisher that
+      already contributed this event (same source URL) — that is the
+      publisher correcting its own record (e.g. the event was rescheduled).
+      A different publisher disagreeing does NOT overwrite the value: two
+      outlets reporting different dates would otherwise flip-flop the field
+      on every crawl. The disagreement is still recorded in the history so a
+      human can see it.
+    """
     changed: dict[str, dict] = {}
+    conflicts: dict[str, dict] = {}
+    # Is this the same publisher that already contributed this event?
+    same_publisher = False
+    if url:
+        same_publisher = db.query(EventSource).filter_by(
+            event_id=existing.id, url=url).first() is not None
     for key, new_val in fields.items():
         old_val = getattr(existing, key, None)
         if new_val in (None, "未知", "待核实", ""):
             continue  # never overwrite confirmed data with unknown
-        if old_val in (None, "未知", "待核实", "") or key in ("last_confirmed_at",):
+        if old_val in (None, "未知", "待核实", ""):
             if old_val != new_val:
                 changed[key] = {"old": str(old_val), "new": str(new_val)}
                 setattr(existing, key, new_val)
+            continue
+        if old_val == new_val:
+            continue
+        # both sides are confirmed and they disagree
+        if same_publisher:
+            changed[key] = {"old": str(old_val), "new": str(new_val)}
+            setattr(existing, key, new_val)
+        else:
+            conflicts[key] = {"kept": str(old_val), "other_source_said": str(new_val)}
     if url:
         exists = db.query(EventSource).filter_by(event_id=existing.id, url=url).first()
         if not exists:
             db.add(EventSource(event_id=existing.id, source_id=source_id, url=url, title=title))
             changed.setdefault("sources_added", {"old": "", "new": url})
-    existing.last_confirmed_at = datetime.utcnow()
-    if changed:
+    existing.last_confirmed_at = utcnow()
+    if changed or conflicts:
         from ..models import EventHistory
-        db.add(EventHistory(event_id=existing.id, changed_fields=changed))
+        payload = dict(changed)
+        if conflicts:
+            payload["conflicts"] = conflicts
+        db.add(EventHistory(event_id=existing.id, changed_fields=payload))
     db.commit()
     return existing, [f"{k}: {v['old']} -> {v['new']}" for k, v in changed.items()]

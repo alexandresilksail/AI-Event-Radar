@@ -10,7 +10,8 @@ from pathlib import Path
 import pytest
 
 from app.collectors import safe_get, CollectorError, ChangeDetectionCollector, HTMLCollector
-from app.models import SchedulerLock, Source, User
+from app.models import SchedulerLock, Source, User, utcnow
+
 from app.security import (SSRFError, is_public_ip, validate_public_url,
                           _orig_getaddrinfo, install_guarded_resolver,
                           uninstall_guarded_resolver)
@@ -353,11 +354,11 @@ class TestSchedulerLock:
         # another "process" cannot steal a fresh lock
         row = db.get(SchedulerLock, 1)
         row.holder = "other-host:999"
-        row.heartbeat_at = datetime.utcnow()
+        row.heartbeat_at = utcnow()
         db.commit()
         assert try_acquire_lock(db) is False
         # stale lock can be taken over
-        row.heartbeat_at = datetime.utcnow() - timedelta(seconds=99999)
+        row.heartbeat_at = utcnow() - timedelta(seconds=99999)
         db.commit()
         assert try_acquire_lock(db) is True
         release_lock(db)

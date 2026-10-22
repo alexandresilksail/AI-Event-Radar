@@ -11,6 +11,7 @@ SSRF defense-in-depth (P0 final hardening):
 3. Per-request + per-hop re-validation lives in collectors.base.safe_get.
 """
 import hashlib
+import hmac
 import ipaddress
 import os
 import socket
@@ -68,8 +69,42 @@ BLOCKED_HOSTNAMES = {
     "metadata.goog", "instance-data",
 }
 
-_orig_getaddrinfo = socket.getaddrinfo
+_NATIVE_GETADDRINFO = socket.getaddrinfo  # pristine native resolver (never reassigned)
+_orig_getaddrinfo = socket.getaddrinfo     # swappable seam: tests inject a fake resolver here
 _RESOLVER_INSTALLED = False
+
+
+def trusted_internal_hosts() -> set[str]:
+    """Operator-configured endpoints that are allowed to live on a private network.
+
+    The global resolver guard rejects ANY hostname that resolves to a non-public
+    address. That is correct for user-supplied crawl targets, but it would also
+    break operator-configured integrations that legitimately live inside a
+    private network (corporate SMTP relay, a self-hosted LLM gateway, ...).
+
+    Those endpoints are trusted because they come from the deployment
+    configuration (env vars), never from user input. They are NOT crawl
+    targets: every user-supplied URL is still validated by
+    `validate_public_url()`, which performs its own DNS + public-IP check
+    independently of this global guard.
+    """
+    hosts: set[str] = set()
+    for part in (settings.TRUSTED_INTERNAL_HOSTS or "").split(","):
+        p = part.strip().lower()
+        if p:
+            hosts.add(p)
+    smtp = (settings.SMTP_HOST or "").strip()
+    if smtp:
+        hosts.add(smtp.split(":")[0].strip().lower())
+    if settings.AI_BASE_URL:
+        try:
+            h = urlparse(settings.AI_BASE_URL).hostname
+            if h:
+                hosts.add(h.lower())
+        except Exception:
+            pass
+    hosts.discard("")
+    return hosts
 
 
 def is_public_ip(ip_str: str) -> bool:
@@ -117,6 +152,10 @@ def install_guarded_resolver() -> None:
 
     Policy: if a hostname resolves to ANY non-public address, the target is
     rejected entirely (a mixed A/AAAA set is treated as untrusted).
+    Operator-configured private endpoints (see `trusted_internal_hosts`) are
+    exempt — they come from env config, never from user input, and user-facing
+    crawl targets are validated separately by `validate_public_url()`.
+
     Idempotent; called once at app/worker startup (and by tests)."""
     global _RESOLVER_INSTALLED
     if _RESOLVER_INSTALLED:
@@ -127,6 +166,8 @@ def install_guarded_resolver() -> None:
         results = _orig_getaddrinfo(host, port, *args, **kwargs)
         if _is_ip_literal(host):
             return results  # literal IPs are validated per-request in validate_public_url
+        if str(host).lower() in trusted_internal_hosts():
+            return results  # operator-trusted private endpoint
         bad = [r for r in results if not is_public_ip(r[4][0])]
         if bad:
             raise SSRFError(
@@ -138,11 +179,17 @@ def install_guarded_resolver() -> None:
 
 def uninstall_guarded_resolver() -> None:
     """Restore the native resolver. Production keeps it installed for the process
-    lifetime; tests use this to avoid polluting process-wide state."""
+    lifetime; tests use this to avoid polluting process-wide state.
+
+    Restores `_NATIVE_GETADDRINFO` — the pristine function captured at import
+    time — NOT the mutable `_orig_getaddrinfo` seam. Restoring the seam would
+    install a test-injected fake resolver process-wide and silently disable
+    SSRF enforcement for every later test module.
+    """
     global _RESOLVER_INSTALLED
     if not _RESOLVER_INSTALLED:
         return
-    socket.getaddrinfo = _orig_getaddrinfo
+    socket.getaddrinfo = _NATIVE_GETADDRINFO
     _RESOLVER_INSTALLED = False
 
 
@@ -154,10 +201,16 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(password: str, stored: str) -> bool:
+    """Constant-time password verification.
+
+    Uses hmac.compare_digest instead of `==` so that a wrong guess cannot be
+    distinguished from a correct one by response timing (byte-by-byte early
+    exit). Any malformed stored value simply fails verification.
+    """
     try:
         _, salt_hex, dk_hex = stored.split("$")
         dk = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), 120_000)
-        return dk.hex() == dk_hex
+        return hmac.compare_digest(dk.hex(), dk_hex)
     except Exception:
         return False
 
@@ -239,4 +292,39 @@ def sanitize_text(text: str, max_len: int = 20000) -> str:
     if not text:
         return ""
     cleaned = "".join(ch for ch in text if ch == "\n" or ch == "\t" or ord(ch) >= 32)
+    return cleaned[:max_len]
+
+
+# Schemes that are safe to put in an href/src. Everything else (javascript:,
+# data:, vbscript:, file:, ...) is dropped. Scraped feeds are untrusted input and
+# a `javascript:` URL rendered into an <a href> would execute in our origin.
+SAFE_URL_SCHEMES = ("http://", "https://")
+
+
+def sanitize_url(url: str, max_len: int = 2000) -> str:
+    """Return the URL only if its scheme is safe to render; otherwise "".
+
+    Guards the stored-XSS path: a hostile feed can put
+    `<link>javascript:alert(1)</link>` in an item. The value is persisted and
+    later rendered by the frontend as an anchor href. React escapes text but
+    does NOT filter the href scheme, so the scheme must be rejected here, at
+    the point where untrusted data enters the database.
+
+    Scheme detection is deliberately conservative: the URL must start with
+    http:// or https:// after stripping leading whitespace and control
+    characters. A scheme-less relative URL is allowed (it cannot carry a
+    scheme) but is length-capped.
+    """
+    if not url or not isinstance(url, str):
+        return ""
+    # strip control characters/whitespace that could hide the scheme
+    cleaned = "".join(c for c in url if c not in "\r\n\t\x00" and ord(c) >= 32).strip()
+    if not cleaned:
+        return ""
+    lowered = cleaned.lower()
+    if not lowered.startswith(SAFE_URL_SCHEMES):
+        # allow scheme-less relative paths, but reject anything carrying a scheme
+        head = cleaned.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+        if ":" in head:
+            return ""
     return cleaned[:max_len]

@@ -10,16 +10,33 @@
 - 系统监控 API（组件状态、24h 统计、告警、磁盘）
 - 仪表盘新增字段（7 日趋势、今日成功率、平均耗时）
 """
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import httpx
 import pytest
 
-from app.models import CrawlLog, CrawlTask, Event, RawDocument, Source
+from app.models import CrawlLog, CrawlTask, Event, RawDocument, Source, utcnow
+
 from app.services import scheduler as sched
 
 
-def _mock_get(monkeypatch, content="<html><body>AI summit</body></html>", status=200):
+def _rss_body(item_title="AI summit", item_link="https://feed.example.com/item"):
+    """A minimal but VALID RSS 2.0 document.
+
+    The RSS collector rejects responses that are not a feed at all (a captcha
+    wall or an HTML page), so a mock for an `rss` source must return real
+    feed XML — returning HTML here would now be (correctly) an error.
+    """
+    return ("<?xml version='1.0' encoding='UTF-8'?>"
+            "<rss version='2.0'><channel><title>feed</title>"
+            f"<item><title>{item_title}</title><link>{item_link}</link>"
+            "<description>AI summit</description></item>"
+            "</channel></rss>")
+
+
+def _mock_get(monkeypatch, content=None, status=200):
+    if content is None:
+        content = _rss_body()
     def fake_safe_get(url, timeout=None, method="GET"):
         return httpx.Response(status, content=content.encode(),
                              request=httpx.Request("GET", url))
@@ -36,28 +53,28 @@ def src(db):
 
 
 class TestSourceList:
-    def test_list_with_filters_and_pagination(self, client, db):
+    def test_list_with_filters_and_pagination(self, client, auth_headers, db):
         for i in range(3):
             db.add(Source(name=f"源{i}", type="rss", url=f"https://f{i}.example.com/rss",
                           topics="AI,大模型", enabled=(i != 2), frequency_minutes=60))
         db.add(Source(name="HTML 源", type="html", url="https://h.example.com/page"))
         db.commit()
 
-        r = client.get("/sources", params={"page": 1, "page_size": 2}).json()
+        r = client.get("/sources", params={"page": 1, "page_size": 2}, headers=auth_headers).json()
         assert r["total"] >= 4 and len(r["items"]) == 2
         assert set(r["summary"]) >= {"healthy", "failing", "paused", "never"}
 
-        r = client.get("/sources", params={"keyword": "HTML"}).json()
+        r = client.get("/sources", params={"keyword": "HTML"}, headers=auth_headers).json()
         assert r["total"] == 1 and r["items"][0]["type"] == "html"
 
-        r = client.get("/sources", params={"type": "rss", "enabled": "false"}).json()
+        r = client.get("/sources", params={"type": "rss", "enabled": "false"}, headers=auth_headers).json()
         assert all(d["type"] == "rss" and not d["enabled"] for d in r["items"])
 
-        r = client.get("/sources", params={"health": "never"}).json()
+        r = client.get("/sources", params={"health": "never"}, headers=auth_headers).json()
         assert r["total"] >= 3  # 从未成功采集的源（禁用源计为 paused）
         assert all(d["health"] == "never" for d in r["items"])
 
-    def test_soft_deleted_excluded(self, client, db):
+    def test_soft_deleted_excluded(self, client, auth_headers, db):
         s = Source(name="待删除源", type="rss", url="https://del.example.com/rss")
         db.add(s)
         db.commit()
@@ -65,9 +82,16 @@ class TestSourceList:
                                                  "password": "test-admin-pass"}).json()["token"]
         h = {"Authorization": f"Bearer {token}"}
         client.delete(f"/sources/{s.id}", headers=h)
-        r = client.get("/sources", params={"keyword": "待删除"}).json()
+        r = client.get("/sources", params={"keyword": "待删除"}, headers=auth_headers).json()
+        # soft-deleted sources must disappear from the list
         assert r["total"] == 0
-        assert client.get(f"/sources/{s.id}").status_code == 404 or True
+        # ...but stay individually retrievable, so the operator can inspect and
+        # restore it (soft delete keeps the record and its history)
+        d = client.get(f"/sources/{s.id}", headers=auth_headers)
+        assert d.status_code == 200
+        assert d.json()["source"]["id"] == s.id
+        # a source that truly does not exist is a 404
+        assert client.get("/sources/999999", headers=auth_headers).status_code == 404
 
 
 class TestSourceLifecycle:
@@ -78,7 +102,7 @@ class TestSourceLifecycle:
             "frequency_minutes": 30})
         assert r.status_code == 201, r.text
         sid = r.json()["id"]
-        d = client.get(f"/sources/{sid}").json()["source"]
+        d = client.get(f"/sources/{sid}", headers=auth_headers).json()["source"]
         assert d["topics"] == "AI,峰会" and d["timezone"] == "Asia/Shanghai"
         assert d["note"] == "官方站点" and d["frequency_minutes"] == 30
 
@@ -96,21 +120,21 @@ class TestSourceLifecycle:
             "name": "新名", "type": "rss", "url": "https://new.example.com/rss",
             "topics": "AI", "frequency_minutes": 15})
         assert r.status_code == 200
-        d = client.get(f"/sources/{s.id}").json()["source"]
+        d = client.get(f"/sources/{s.id}", headers=auth_headers).json()["source"]
         assert d["name"] == "新名" and d["frequency_minutes"] == 15
 
     def test_pause_resume(self, client, auth_headers, src):
         r = client.post(f"/sources/{src.id}/pause", headers=auth_headers)
         assert r.status_code == 200
-        d = client.get(f"/sources/{src.id}").json()["source"]
+        d = client.get(f"/sources/{src.id}", headers=auth_headers).json()["source"]
         assert d["enabled"] is False and d["status"] == "paused" and d["health"] == "paused"
         r = client.post(f"/sources/{src.id}/resume", headers=auth_headers)
-        d = client.get(f"/sources/{src.id}").json()["source"]
+        d = client.get(f"/sources/{src.id}", headers=auth_headers).json()["source"]
         assert d["enabled"] is True and d["status"] == "active"
 
     def test_soft_delete_preserves_history_and_restore(self, client, auth_headers, src, db):
         db.add(CrawlLog(source_id=src.id, status="success",
-                        started_at=datetime.utcnow() - timedelta(hours=1)))
+                        started_at=utcnow() - timedelta(hours=1)))
         db.commit()
         r = client.delete(f"/sources/{src.id}", headers=auth_headers)
         assert r.json()["deleted"] == "soft"
@@ -118,14 +142,14 @@ class TestSourceLifecycle:
         assert db.query(CrawlLog).filter_by(source_id=src.id).count() == 1
         r = client.post(f"/sources/{src.id}/restore", headers=auth_headers)
         assert r.json()["restored"] is True
-        assert client.get(f"/sources/{src.id}").status_code == 200
+        assert client.get(f"/sources/{src.id}", headers=auth_headers).status_code == 200
 
     def test_permanent_delete(self, client, auth_headers, db):
         s = Source(name="永久删除", type="rss", url="https://perm.example.com/rss")
         db.add(s); db.commit()
         sid = s.id
         db.add(CrawlLog(source_id=sid, status="success",
-                        started_at=datetime.utcnow()))
+                        started_at=utcnow()))
         db.commit()
         r = client.delete(f"/sources/{sid}", params={"permanent": True}, headers=auth_headers)
         assert r.json()["deleted"] == "permanent"
@@ -174,7 +198,7 @@ class TestSourceOperations:
 
 
 class TestTaskManagement:
-    def test_task_list_and_detail(self, client, db, monkeypatch):
+    def test_task_list_and_detail(self, client, auth_headers, db, monkeypatch):
         s = Source(name="任务监控源", type="rss", url="https://tm.example.com/rss")
         db.add(s); db.commit()
         _mock_get(monkeypatch)
@@ -183,17 +207,17 @@ class TestTaskManagement:
         h = {"Authorization": f"Bearer {token}"}
         client.post(f"/sources/{s.id}/trigger", headers=h)
 
-        r = client.get("/crawl-tasks").json()
+        r = client.get("/crawl-tasks", headers=auth_headers).json()
         assert r["total"] >= 1
         item = r["items"][0]
         assert item["trigger_label"] == "手动触发" and item["source_name"] == "任务监控源"
 
-        d = client.get(f"/crawl-tasks/{item['id']}").json()
+        d = client.get(f"/crawl-tasks/{item['id']}", headers=auth_headers).json()
         assert d["task"]["id"] == item["id"]
         assert d["source"]["id"] == s.id
         assert isinstance(d["logs"], list)
 
-    def test_retry_failed_task_creates_linked_task(self, client, db, monkeypatch):
+    def test_retry_failed_task_creates_linked_task(self, client, auth_headers, db, monkeypatch):
         from app.collectors.base import CollectorError
 
         def boom(url, **kw):
@@ -206,8 +230,8 @@ class TestTaskManagement:
         h = {"Authorization": f"Bearer {token}"}
         # 直接手动构造失败任务（不依赖采集重试逻辑）
         t = CrawlTask(source_id=s.id, status="failed", trigger="scheduled",
-                      started_at=datetime.utcnow() - timedelta(minutes=5),
-                      finished_at=datetime.utcnow() - timedelta(minutes=4),
+                      started_at=utcnow() - timedelta(minutes=5),
+                      finished_at=utcnow() - timedelta(minutes=4),
                       error="模拟失败", attempts=1)
         db.add(t); db.commit()
         r = client.post(f"/crawl-tasks/{t.id}/retry", headers=h)
@@ -218,7 +242,7 @@ class TestTaskManagement:
     def test_retry_running_task_rejected(self, client, db, monkeypatch):
         s = Source(name="运行中源", type="rss", url="https://run.example.com/rss")
         db.add(s); db.commit()
-        t = CrawlTask(source_id=s.id, status="running", started_at=datetime.utcnow())
+        t = CrawlTask(source_id=s.id, status="running", started_at=utcnow())
         db.add(t); db.commit()
         token = client.post("/auth/login", json={"username": "admin",
                                                  "password": "test-admin-pass"}).json()["token"]
@@ -226,23 +250,23 @@ class TestTaskManagement:
         r = client.post(f"/crawl-tasks/{t.id}/retry", headers=h)
         assert r.status_code == 409
 
-    def test_running_endpoint(self, client, db):
+    def test_running_endpoint(self, client, auth_headers, db):
         s = Source(name="运行源", type="rss", url="https://run2.example.com/rss")
         db.add(s); db.commit()
-        db.add(CrawlTask(source_id=s.id, status="running", started_at=datetime.utcnow()))
+        db.add(CrawlTask(source_id=s.id, status="running", started_at=utcnow()))
         db.commit()
-        r = client.get("/crawl-tasks/running").json()
+        r = client.get("/crawl-tasks/running", headers=auth_headers).json()
         assert len(r["db_running"]) >= 1
         assert "scheduler_is_leader" in r
 
 
 class TestMonitorAndDashboard:
-    def test_monitor_returns_real_data(self, client, db):
+    def test_monitor_returns_real_data(self, client, auth_headers, db):
         db.add(Source(name="监控源", type="rss", url="https://mon.example.com/rss"))
         db.add(CrawlLog(source_id=1, status="success",
-                        started_at=datetime.utcnow() - timedelta(hours=2)))
+                        started_at=utcnow() - timedelta(hours=2)))
         db.commit()
-        d = client.get("/monitor").json()
+        d = client.get("/monitor", headers=auth_headers).json()
         assert d["components"]["api"]["status"] == "healthy"
         assert d["components"]["database"]["status"] in ("healthy", "down")
         assert d["crawl_24h"]["total"] >= 1
@@ -256,12 +280,12 @@ class TestMonitorAndDashboard:
         s = Source(name="趋势源", type="rss", url="https://tr.example.com/rss")
         db.add(s); db.commit()
         db.add(CrawlLog(source_id=s.id, status="success",
-                        started_at=datetime.utcnow() - timedelta(hours=3),
-                        finished_at=datetime.utcnow() - timedelta(hours=3) + timedelta(seconds=2),
+                        started_at=utcnow() - timedelta(hours=3),
+                        finished_at=utcnow() - timedelta(hours=3) + timedelta(seconds=2),
                         new_count=1))
         db.add(CrawlLog(source_id=s.id, status="failed",
-                        started_at=datetime.utcnow() - timedelta(hours=1),
-                        finished_at=datetime.utcnow() - timedelta(hours=1) + timedelta(seconds=1),
+                        started_at=utcnow() - timedelta(hours=1),
+                        finished_at=utcnow() - timedelta(hours=1) + timedelta(seconds=1),
                         error="x"))
         db.commit()
         d = client.get("/stats/dashboard").json()

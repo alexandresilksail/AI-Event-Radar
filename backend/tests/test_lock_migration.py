@@ -13,12 +13,14 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import pytest
 from sqlalchemy import text
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from app.models import utcnow  # noqa: E402
 
 BACKEND = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 REPO = os.path.abspath(os.path.join(BACKEND, ".."))
@@ -42,7 +44,7 @@ def lock_db(tmp_path):
 
 def _age_lock(db, seconds):
     db.execute(text("UPDATE scheduler_locks SET heartbeat_at = :t WHERE id = 1"),
-               {"t": (datetime.utcnow() - timedelta(seconds=seconds)).isoformat(sep=" ")})
+               {"t": (utcnow() - timedelta(seconds=seconds)).isoformat(sep=" ")})
     db.commit()
 
 
@@ -443,7 +445,7 @@ class TestHealthEndpoints:
     def _put_lock(self, db, holder, age_seconds=0):
         from app.models import SchedulerLock
         self._clear_lock(db)
-        ts = datetime.utcnow() - timedelta(seconds=age_seconds)
+        ts = utcnow() - timedelta(seconds=age_seconds)
         db.add(SchedulerLock(id=1, holder=holder, acquired_at=ts,
                              heartbeat_at=ts, lease_version=1))
         db.commit()

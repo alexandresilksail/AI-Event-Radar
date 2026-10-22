@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { api, fmt } from '../api'
+import { api, fmt, safeHref } from '../api'
 import { Card, Empty, ErrorBox, PageHead, SkeletonRows } from '../components/ui'
 
 export default function EventDetail() {
@@ -77,7 +77,9 @@ export default function EventDetail() {
                 {e.sources.map((s: any, i: number) => (
                   <tr key={i}>
                     <td>{s.title || '—'}</td>
-                    <td><a href={s.url} target="_blank" rel="noopener noreferrer nofollow" className="url-cell">{s.url}</a></td>
+                    <td>{s.url ? (
+                      <a href={safeHref(s.url)} target="_blank" rel="noopener noreferrer nofollow" className="url-cell">{s.url}</a>
+                    ) : <span className="muted">—</span>}</td>
                     <td className="tiny muted">{fmt(s.first_seen_at)}</td>
                   </tr>
                 ))}

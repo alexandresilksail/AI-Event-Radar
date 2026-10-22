@@ -10,6 +10,36 @@ from ..config import settings as app_settings
 
 router = APIRouter(tags=["notifications-settings"])
 
+MASK = "***"
+# Config keys whose values are secrets. Masked on read AND preserved on write,
+# so that editing a rule in the UI (which loads the masked config back into the
+# form) never destroys the stored credential.
+SECRET_KEY_HINTS = ("password", "token", "key", "secret", "webhook_url",
+                    "bot_token", "wecom_webhook_key")
+
+
+def _is_secret_key(k: str) -> bool:
+    kl = (k or "").lower()
+    return any(h in kl for h in SECRET_KEY_HINTS)
+
+
+def _mask_config(config: dict | None) -> dict:
+    return {k: (MASK if _is_secret_key(k) else v) for k, v in (config or {}).items()}
+
+
+def _merge_preserving_secrets(stored: dict | None, incoming: dict | None) -> dict:
+    """Merge an incoming config over the stored one.
+
+    A masked value ("***") means "the client did not change this secret" — the
+    stored value is kept. Any other incoming value replaces the stored one.
+    """
+    out = dict(stored or {})
+    for k, v in (incoming or {}).items():
+        if v == MASK and k in out:
+            continue
+        out[k] = v
+    return out
+
 
 class RuleBody(BaseModel):
     name: str
@@ -20,13 +50,17 @@ class RuleBody(BaseModel):
 
 
 @router.get("/notification-rules")
-def list_rules(db: Session = Depends(get_db)):
+def list_rules(user: dict = Depends(current_user), db: Session = Depends(get_db)):
+    """List notification rules (authenticated).
+
+    Credentials are masked on read. The masked form is also what the UI sends
+    back on edit, so the server preserves the stored secret in that case.
+    """
     rules = db.query(NotificationRule).all()
     logs = (db.query(NotificationLog).order_by(NotificationLog.sent_at.desc())
             .limit(50).all())
     return {"rules": [{"id": r.id, "name": r.name, "channel": r.channel,
-                       "config": {k: ("***" if "password" in k or "token" in k or "key" in k else v)
-                                  for k, v in (r.config or {}).items()},
+                       "config": _mask_config(r.config),
                        "filters": r.filters, "enabled": r.enabled} for r in rules],
             "recent_logs": [{"id": l.id, "rule_id": l.rule_id, "event_id": l.event_id,
                              "event_type": l.event_type, "status": l.status,
@@ -52,8 +86,12 @@ def update_rule(rule_id: int, body: RuleBody, request: Request,
     if not r:
         raise HTTPException(404, "规则不存在")
     for k, v in body.model_dump().items():
-        if k == "config" and not v:
-            continue  # don't blank out stored credentials
+        if k == "config":
+            if not v:
+                continue  # don't blank out stored credentials
+            # masked values mean "unchanged" — never overwrite a stored secret
+            r.config = _merge_preserving_secrets(r.config, v)
+            continue
         setattr(r, k, v)
     db.commit()
     audit(request, user, "update_notification_rule", f"rule #{r.id}", db)
@@ -73,8 +111,13 @@ def delete_rule(rule_id: int, request: Request,
 
 
 @router.post("/notification-rules/{rule_id}/test")
-def test_rule(rule_id: int, db: Session = Depends(get_db)):
-    """Send a test notification; reports exactly why it failed if credentials missing."""
+def test_rule(rule_id: int, user: dict = Depends(current_user),
+              db: Session = Depends(get_db)):
+    """Send a test notification (authenticated); reports exactly why it failed.
+
+    Requires authentication: this endpoint performs a real outbound send using
+    the stored credentials, so it must never be triggerable anonymously.
+    """
     from ..services.notifier import SENDERS
     r = db.get(NotificationRule, rule_id)
     if not r:
@@ -87,7 +130,7 @@ def test_rule(rule_id: int, db: Session = Depends(get_db)):
                                 "text": "这是一条 AI Event Radar 测试通知 ✅"})
         return {"ok": True}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": str(e)[:300]}
 
 
 # ---------- system settings (non-sensitive only) ----------
@@ -95,7 +138,12 @@ SENSITIVE_KEYS = {"jwt_secret", "smtp_password", "ai_api_key", "search_api_key"}
 
 
 @router.get("/settings")
-def get_settings():
+def get_settings(user: dict = Depends(current_user)):
+    """Non-sensitive runtime configuration (authenticated).
+
+    Only non-sensitive values are returned; credentials live in server-side
+    environment variables and are never exposed to the browser.
+    """
     return {
         "timezone": "UTC",
         "language": "zh",

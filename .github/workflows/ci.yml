@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same branch/PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest httpx pip-audit
+
+      - name: Run test suite (offline)
+        # The default pytest run excludes `real_network` tests: they hit a
+        # third-party host and are not a reliable CI signal.
+        run: python -m pytest tests/ -q
+
+      - name: Run real-network end-to-end tests (non-blocking)
+        # Informational only: upstream outages must not fail the build.
+        continue-on-error: true
+        run: python -m pytest tests/ -q -m real_network
+
+      - name: Audit Python dependencies for known vulnerabilities
+        # The requirements are pinned, so this is a reproducible scan.
+        run: python -m pip_audit -r requirements.txt --progress-spinner off
+
+      - name: Verify Alembic migration chain has a single head
+        run: |
+          python -m alembic heads
+          test "$(python -m alembic heads | grep -c '(head)')" -eq 1
+
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check and build
+        run: npm run build
+
+      - name: Audit dependencies
+        # High/critical only: the two known react-router advisories are
+        # moderate and not reachable in this app (no user-controlled
+        # navigation targets, no SSR).
+        run: npm audit --omit=dev --audit-level=high

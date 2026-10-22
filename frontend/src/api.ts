@@ -34,3 +34,22 @@ export const fmt = (d: string | null | undefined): string =>
 
 export const fmtDate = (d: string | null | undefined): string =>
   d ? new Date(d).toLocaleDateString('zh-CN') : '未知'
+
+/**
+ * Return a URL that is safe to put in an href/src, or '' if it is not.
+ *
+ * The backend already rejects unsafe schemes when storing scraped URLs, but
+ * this is the last line of defence: React escapes TEXT but does not filter
+ * the href scheme, so a `javascript:` URL would execute in our own origin.
+ * Only http(s) and scheme-less relative paths are allowed.
+ */
+export function safeHref(url: string | null | undefined): string {
+  if (!url) return ''
+  const cleaned = url.replace(/[\r\n\t\0]/g, '').trim()
+  if (!cleaned) return ''
+  const lower = cleaned.toLowerCase()
+  if (lower.startsWith('http://') || lower.startsWith('https://')) return cleaned
+  // scheme-less relative path is safe
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(cleaned)) return cleaned
+  return ''
+}

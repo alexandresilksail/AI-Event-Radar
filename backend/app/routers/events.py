@@ -6,7 +6,8 @@ from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from ..database import get_db
-from ..models import CrawlLog, Event, EventHistory, EventSource, RawDocument, Source
+from ..deps import current_user
+from ..models import CrawlLog, Event, EventHistory, EventSource, RawDocument, Source, utcnow
 from ..security import create_token  # noqa: F401 (kept for reuse)
 from ..services import scheduler as sched
 
@@ -72,7 +73,7 @@ def event_detail(event_id: int, db: Session = Depends(get_db)):
 @router.get("/calendar")
 def calendar_events(view: str = "month", date: str = "", country: str = "",
                     city: str = "", type: str = "", db: Session = Depends(get_db)):
-    base = date or datetime.utcnow().strftime("%Y-%m-%d")
+    base = date or utcnow().strftime("%Y-%m-%d")
     anchor = datetime.strptime(base, "%Y-%m-%d")
     if view == "week":
         start = anchor - timedelta(days=anchor.weekday())
@@ -115,7 +116,9 @@ def _event_dict(e: Event, db: Session) -> dict:
 # ---------- crawl logs ----------
 @router.get("/crawl-logs")
 def crawl_logs(date: str = "", source_id: int = 0, status: str = "",
-               page: int = 1, page_size: int = 50, db: Session = Depends(get_db)):
+               page: int = 1, page_size: int = 50,
+               user: dict = Depends(current_user), db: Session = Depends(get_db)):
+    """Crawl logs (authenticated): contain source URLs and raw error text."""
     query = db.query(CrawlLog)
     if date:
         query = query.filter(func.date(CrawlLog.started_at) == date)
@@ -142,7 +145,7 @@ def crawl_logs(date: str = "", source_id: int = 0, status: str = "",
 # ---------- stats ----------
 @router.get("/stats/dashboard")
 def dashboard_stats(db: Session = Depends(get_db)):
-    now = datetime.utcnow()
+    now = utcnow()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     total_sources = db.query(func.count(Source.id)).scalar() or 0
     healthy = (db.query(func.count(Source.id))
@@ -216,7 +219,7 @@ def dashboard_stats(db: Session = Depends(get_db)):
 
 @router.get("/stats/analysis")
 def analysis_stats(db: Session = Depends(get_db)):
-    now = datetime.utcnow()
+    now = utcnow()
 
     def bucket(days_from, days_to):
         return (db.query(func.count(Event.id))

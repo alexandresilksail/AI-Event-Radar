@@ -11,17 +11,23 @@ from sqlalchemy import func, text
 
 from ..config import settings
 from ..database import SessionLocal, get_db
-from ..models import CrawlLog, Source
+from ..deps import current_user
+from ..models import CrawlLog, Source, utcnow
 from ..services import scheduler as sched
 
 router = APIRouter(prefix="/monitor", tags=["monitor"])
 
-BOOT_AT = datetime.utcnow()  # 本进程启动时间（重启后归零，反映本次连续运行）
+BOOT_AT = utcnow()  # 本进程启动时间（重启后归零，反映本次连续运行）
 
 
 @router.get("")
-def monitor(db=Depends(get_db)):
-    now = datetime.utcnow()
+def monitor(user: dict = Depends(current_user), db=Depends(get_db)):
+    """Operational monitoring snapshot (authenticated).
+
+    Exposes internal state (disk usage, uptime, scheduler internals, recent
+    error text), so it requires a valid token rather than being world-readable.
+    """
+    now = utcnow()
     day_ago = now - timedelta(hours=24)
 
     # --- database ---

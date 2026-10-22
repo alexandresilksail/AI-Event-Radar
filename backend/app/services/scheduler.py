@@ -26,7 +26,7 @@ from sqlalchemy import update
 
 from ..config import settings
 from ..database import SessionLocal
-from ..models import SchedulerLock, Source
+from ..models import SchedulerLock, Source, utcnow
 
 logger = logging.getLogger("radar.scheduler")
 
@@ -115,7 +115,7 @@ def try_acquire_lock(db) -> bool:
     in one UPDATE; only the process whose WHERE clause still matches gets
     rowcount 1. Insert uses INSERT-or-ignore semantics for the first race.
     """
-    now = datetime.utcnow()
+    now = utcnow()
     stale_cutoff = now - timedelta(seconds=settings.SCHEDULER_LOCK_TTL)
     # 1) create row if missing (race-safe on both SQLite and PG)
     try:
@@ -145,7 +145,7 @@ def heartbeat(db) -> bool:
     result = db.execute(
         update(SchedulerLock)
         .where(SchedulerLock.id == 1, SchedulerLock.holder == HOLDER_ID)
-        .values(heartbeat_at=datetime.utcnow())
+        .values(heartbeat_at=utcnow())
     )
     db.commit()
     return result.rowcount == 1
@@ -160,7 +160,7 @@ def _lease_still_held(db) -> bool:
     row = db.get(SchedulerLock, 1)
     if not row or row.holder != HOLDER_ID:
         return False
-    stale = datetime.utcnow() - (row.heartbeat_at or datetime.utcnow()) > \
+    stale = utcnow() - (row.heartbeat_at or utcnow()) > \
         timedelta(seconds=settings.SCHEDULER_LOCK_TTL)
     return not stale
 
@@ -279,7 +279,7 @@ def lease_status() -> dict:
                     "lease_valid": False, "heartbeat_age_seconds": None,
                     "lease_version": None, "lock_ttl_seconds": settings.SCHEDULER_LOCK_TTL}
         heartbeat = lock.heartbeat_at or lock.acquired_at
-        age = (datetime.utcnow() - heartbeat).total_seconds() if heartbeat else None
+        age = (utcnow() - heartbeat).total_seconds() if heartbeat else None
         valid = age is None or age <= settings.SCHEDULER_LOCK_TTL
         return {
             "leader_elected": True,

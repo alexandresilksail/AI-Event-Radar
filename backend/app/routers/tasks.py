@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..deps import audit, current_user
-from ..models import CrawlLog, CrawlTask, Event, EventSource, RawDocument, Source
+from ..models import CrawlLog, CrawlTask, Event, EventSource, RawDocument, Source, utcnow
 from ..services import scheduler as sched
 from ..services.pipeline import create_task_and_crawl
 
@@ -45,7 +45,8 @@ def _task_dict(t: CrawlTask, source_name: str | None = None) -> dict:
 def list_tasks(source_id: int = 0, status: str = "", trigger: str = "",
                date_from: str = "", date_to: str = "",
                page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=200),
-               db: Session = Depends(get_db)):
+               user: dict = Depends(current_user), db: Session = Depends(get_db)):
+    """Task list (authenticated): contains source names and raw error text."""
     q = db.query(CrawlTask)
     if source_id:
         q = q.filter(CrawlTask.source_id == source_id)
@@ -66,7 +67,7 @@ def list_tasks(source_id: int = 0, status: str = "", trigger: str = "",
 
 
 @router.get("/running")
-def running_tasks(db: Session = Depends(get_db)):
+def running_tasks(user: dict = Depends(current_user), db: Session = Depends(get_db)):
     """正在执行的任务（DB 中的 running 任务 + 调度器实际运行中的源）。"""
     rows = (db.query(CrawlTask).filter(CrawlTask.status == "running")
             .order_by(CrawlTask.started_at.desc()).all())
@@ -80,7 +81,9 @@ def running_tasks(db: Session = Depends(get_db)):
 
 
 @router.get("/{task_id}")
-def task_detail(task_id: int, db: Session = Depends(get_db)):
+def task_detail(task_id: int, user: dict = Depends(current_user),
+                db: Session = Depends(get_db)):
+    """Task detail (authenticated): contains source URL and raw error text."""
     t = db.get(CrawlTask, task_id)
     if not t:
         raise HTTPException(404, "任务不存在")
@@ -90,7 +93,7 @@ def task_detail(task_id: int, db: Session = Depends(get_db)):
     # 关联活动：任务执行窗口内该源发现的活动
     related = []
     if t.started_at:
-        end = t.finished_at or datetime.utcnow()
+        end = t.finished_at or utcnow()
         docs = (db.query(RawDocument.url)
                 .filter(RawDocument.source_id == t.source_id,
                         RawDocument.fetched_at >= t.started_at,

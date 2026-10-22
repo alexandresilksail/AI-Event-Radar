@@ -17,7 +17,7 @@ from ..collectors import COLLECTORS
 from ..database import get_db
 from ..deps import audit, current_user
 from ..models import (CrawlLog, CrawlTask, Event, EventSource, RawDocument,
-                      Source, SourceState)
+                     Source, SourceState, utcnow)
 from ..security import SSRFError, validate_public_url
 from ..services.pipeline import create_task_and_crawl
 from ..services import scheduler as sched
@@ -78,7 +78,7 @@ def source_dict(s: Source) -> dict:
 def _bucket_by_hour(rows) -> list[dict]:
     """rows: (started_at, new_count) — bucket into 24 hourly slots ending now."""
     from datetime import datetime, timedelta
-    now = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+    now = utcnow().replace(minute=0, second=0, microsecond=0)
     slots = {}
     for i in range(24, 0, -1):
         slots[(now - timedelta(hours=i)).strftime("%m-%d %H时")] = {"tasks": 0, "new_events": 0}
@@ -94,7 +94,7 @@ def _bucket_by_hour(rows) -> list[dict]:
 
 def _bucket_by_day(rows, days: int = 7) -> list[dict]:
     from datetime import datetime, timedelta
-    now = datetime.utcnow().date()
+    now = utcnow().date()
     slots = {}
     for i in range(days - 1, -1, -1):
         d = now - timedelta(days=i)
@@ -155,7 +155,8 @@ def list_sources(keyword: str = "", type: str = "", status: str = "",
                  enabled: str = "", health: str = "",
                  sort: str = "id", order: str = "asc",
                  page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=200),
-                 db: Session = Depends(get_db)):
+                 user: dict = Depends(current_user), db: Session = Depends(get_db)):
+    """Source list (authenticated): contains target URLs and internal error text."""
     q = db.query(Source).filter(Source.deleted_at.is_(None))
     if keyword:
         like = f"%{keyword.strip()}%"
@@ -289,7 +290,7 @@ def delete_source(source_id: int, request: Request, permanent: bool = False,
         db.commit()
         audit(request, user, "delete_source_permanent", f"source #{source_id} {s.name}", db)
         return {"deleted": "permanent", "id": source_id}
-    s.deleted_at = datetime.utcnow()
+    s.deleted_at = utcnow()
     s.enabled, s.status = False, "paused"
     db.commit()
     audit(request, user, "delete_source", f"soft delete source #{source_id} {s.name}", db)
@@ -367,7 +368,9 @@ def test_source(source_id: int, request: Request,
 # ---------- detail ----------
 
 @router.get("/{source_id}")
-def source_detail(source_id: int, db: Session = Depends(get_db)):
+def source_detail(source_id: int, user: dict = Depends(current_user),
+                  db: Session = Depends(get_db)):
+    """Source detail (authenticated): contains target URL and internal error text."""
     s = db.get(Source, source_id)
     if not s:
         raise HTTPException(404, "数据源不存在")
@@ -378,7 +381,7 @@ def source_detail(source_id: int, db: Session = Depends(get_db)):
     for l in logs:
         if l.status in counts:
             counts[l.status] += 1
-    now = datetime.utcnow()
+    now = utcnow()
     logs_24h = [l for l in logs if l.started_at and l.started_at >= now - timedelta(hours=24)]
     logs_7d = [l for l in logs if l.started_at and l.started_at >= now - timedelta(days=7)]
     durations = [(l.finished_at - l.started_at).total_seconds() * 1000

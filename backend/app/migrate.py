@@ -33,6 +33,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.pool import NullPool
 
 from .config import encode_db_url, settings
+from .models import utcnow
 
 log = logging.getLogger("radar.migrate")
 
@@ -94,7 +95,7 @@ def _try_enter_guard() -> bool:
                 f"INSERT INTO {GUARD_TABLE} (id, pid, started_at) "
                 "VALUES (1, :pid, :now)"),
                 {"pid": str(os.getpid()),
-                 "now": datetime.utcnow().isoformat()})
+                 "now": utcnow().isoformat()})
         return True
     except (IntegrityError, SQLAlchemyError):
         return False

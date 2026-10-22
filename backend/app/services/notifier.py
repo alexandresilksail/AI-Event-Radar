@@ -12,7 +12,8 @@ import httpx
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..models import Event, NotificationLog, NotificationRule
+from ..models import Event, NotificationLog, NotificationRule, utcnow
+from ..security import validate_public_url
 
 logger = logging.getLogger("radar.notify")
 
@@ -44,15 +45,18 @@ def event_matches_filters(ev: Event, filters: dict) -> bool:
         if not ev.start_time:
             return False
         from datetime import datetime
-        if ev.start_time > datetime.utcnow() + __import__("datetime").timedelta(days=int(days)):
+        if ev.start_time > utcnow() + __import__("datetime").timedelta(days=int(days)):
             return False
     return True
 
 
 def _send_webhook(config: dict, payload: dict) -> None:
     url = config.get("url", "")
-    if not url.startswith("http"):
-        raise ValueError("webhook url 未配置")
+    # A webhook URL is attacker-controllable (any authenticated user can create
+    # a rule), so it must go through the same SSRF policy as crawl targets.
+    # Operator-configured internal endpoints are exempt via
+    # TRUSTED_INTERNAL_HOSTS / SMTP_HOST / AI_BASE_URL.
+    validate_public_url(url)
     r = httpx.post(url, json=payload, timeout=15)
     r.raise_for_status()
 
@@ -91,7 +95,12 @@ def _send_wecom(config: dict, payload: dict) -> None:
     key = config.get("wecom_webhook_key") or config.get("url", "")
     if not key:
         raise ValueError("企业微信机器人 webhook key 未配置")
-    url = key if key.startswith("http") else f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={key}"
+    if key.startswith("http"):
+        # a full URL was supplied: validate it like any other webhook target
+        url = key
+        validate_public_url(url)
+    else:
+        url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={key}"
     r = httpx.post(url, json={"msgtype": "text", "text": {"content": payload["text"]}}, timeout=15)
     r.raise_for_status()
 

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { api, fmt } from '../api'
+import { api, fmt, safeHref } from '../api'
 import {
   Bars, Card, Dot, Empty, ErrorBox, PageHead, SkeletonRows, Timeline,
   healthLabel, healthTone, taskLabel, taskTone, triggerLabel,
@@ -145,7 +145,11 @@ export default function SourceDetail() {
           {d.recent_documents.length === 0 ? <Empty icon="🗂" title="暂无内容" /> : (
             <Timeline items={d.recent_documents.map((doc: any) => ({
               at: fmt(doc.fetched_at),
-              children: <a href={doc.url} target="_blank" rel="noopener noreferrer nofollow">{doc.title || doc.url}</a>,
+              children: safeHref(doc.url) ? (
+                <a href={safeHref(doc.url)} target="_blank" rel="noopener noreferrer nofollow">{doc.title || doc.url}</a>
+              ) : (
+                <span>{doc.title || doc.url || '—'}</span>
+              ),
             }))} />
           )}
         </Card>

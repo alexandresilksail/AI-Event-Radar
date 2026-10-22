@@ -23,6 +23,7 @@ from .config import (auto_migrate_enabled, settings, validate_production_config)
 from .database import SessionLocal
 from .main import migrate_or_init  # legacy/dev bootstrap, gated below
 from .routers.auth import ensure_default_admin
+from .security import install_guarded_resolver
 from .services import scheduler as sched
 
 logging.basicConfig(level=logging.INFO,
@@ -77,6 +78,11 @@ def _start_health_server() -> ThreadingHTTPServer | None:
 
 
 def main() -> None:
+    # The worker is the process that actually performs outbound crawling, so it
+    # MUST install the DNS-level SSRF guard itself. app.main's lifespan() only
+    # runs under uvicorn (the API process) — `python -m app.worker` never
+    # triggers it, which previously left the worker without TOCTOU protection.
+    install_guarded_resolver()
     validate_production_config(settings)
     if auto_migrate_enabled(settings):
         migrate_or_init()

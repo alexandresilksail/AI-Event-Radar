@@ -9,7 +9,8 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from app.models import Event, EventSource, Source
+from app.models import Event, EventSource, Source, utcnow
+
 from app.collectors.base import CollectedItem, CollectorError
 
 
@@ -143,7 +144,7 @@ class TestCrawlPipeline:
         monkeypatch.setattr("app.collectors.base.safe_get", fake_get)
         r = client.post(f"/sources/{s.id}/trigger", headers=auth_headers)
         assert r.json()["status"] == "failed" and "请求失败" in r.json()["error"]
-        logs = client.get("/crawl-logs", params={"status": "failed"}).json()
+        logs = client.get("/crawl-logs", params={"status": "failed"}, headers=auth_headers).json()
         assert logs["total"] >= 1
         assert any("请求失败" in (l["error"] or "") for l in logs["items"])
 
@@ -200,8 +201,8 @@ class TestDedupLayers:
 
 class TestEventStatus:
     def test_finished_event_auto_detected(self, client, db):
-        old = Event(name="过期 AI 沙龙", start_time=datetime.utcnow() - timedelta(days=30),
-                    end_time=datetime.utcnow() - timedelta(days=29))
+        old = Event(name="过期 AI 沙龙", start_time=utcnow() - timedelta(days=30),
+                    end_time=utcnow() - timedelta(days=29))
         db.add(old)
         db.commit()
         from app.services.pipeline import refresh_event_status
@@ -233,7 +234,7 @@ class TestEventAPI:
         assert len(r["sources"]) == 1 and r["sources"][0]["url"].startswith("https://")
 
     def test_calendar(self, client, db):
-        future = Event(name="日历测试峰会", start_time=datetime.utcnow() + timedelta(days=2))
+        future = Event(name="日历测试峰会", start_time=utcnow() + timedelta(days=2))
         db.add(future)
         db.commit()
         r = client.get("/calendar").json()
@@ -241,7 +242,7 @@ class TestEventAPI:
 
 
 class TestNotifications:
-    def test_rule_filter_and_send_with_dedup(self, db):
+    def test_rule_filter_and_send_with_dedup(self, db, monkeypatch):
         from app.models import NotificationRule
         from app.services.notifier import dispatch_new_event
         rule = NotificationRule(name="免费活动通知", channel="webhook",
@@ -256,6 +257,10 @@ class TestNotifications:
         def fake_post(url, **kw):
             calls.append(url)
             return httpx.Response(200, content=b"ok", request=httpx.Request("POST", url))
+        # The webhook URL now goes through the SSRF policy; the fake host cannot
+        # resolve, so stub the validator here. The policy itself is covered
+        # separately by tests/test_release_hardening.py.
+        monkeypatch.setattr("app.services.notifier.validate_public_url", lambda url: url)
         with patch("app.services.notifier.httpx.post", fake_post):
             n1 = dispatch_new_event(db, ev)
             n2 = dispatch_new_event(db, ev)  # same event again — dedup must block
@@ -289,10 +294,10 @@ class TestNotifications:
             "name": "测试规则", "channel": "telegram",
             "config": {"bot_token": "123:abc", "chat_id": "1"}, "filters": {}})
         assert r.status_code == 201
-        rules = client.get("/notification-rules").json()["rules"]
+        rules = client.get("/notification-rules", headers=auth_headers).json()["rules"]
         mine = next(r for r in rules if r["name"] == "测试规则")
         assert mine["config"]["bot_token"] == "***"  # credentials masked in API
-        t = client.post(f"/notification-rules/{mine['id']}/test").json()
+        t = client.post(f"/notification-rules/{mine['id']}/test", headers=auth_headers).json()
         assert t["ok"] is False  # real telegram would fail in test env — reported honestly
 
 
@@ -313,7 +318,14 @@ class TestSettingsSecurity:
                        headers=auth_headers, json={"v": "hack"})
         assert r.status_code == 400
 
-    def test_settings_endpoint_no_secrets(self, client):
-        body = json.dumps(client.get("/settings").json())
+    def test_settings_endpoint_no_secrets(self, client, auth_headers):
+        r = client.get("/settings", headers=auth_headers)
+        assert r.status_code == 200, r.text
+        body = json.dumps(r.json())
         for secret in ("jwt_secret", "smtp_password", "ai_api_key"):
             assert secret not in body
+        # the authenticated response must still not leak credential VALUES
+        assert "test-admin-pass" not in body
+
+    def test_settings_endpoint_requires_auth(self, client):
+        assert client.get("/settings").status_code == 401

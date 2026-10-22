@@ -119,6 +119,13 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: str = ""
     SMTP_FROM: str = ""
 
+    # Operator-configured endpoints allowed to resolve to private networks.
+    # Comma-separated hostnames. SMTP_HOST and the AI_BASE_URL host are added
+    # automatically. These come from deployment config (never user input), so
+    # they are exempt from the global DNS guard; user-supplied crawl targets
+    # are still validated per-request by validate_public_url().
+    TRUSTED_INTERNAL_HOSTS: str = ""
+
 
 def is_production(env: str) -> bool:
     return (env or "").lower() in ("production", "prod")

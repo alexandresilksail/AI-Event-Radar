@@ -15,8 +15,15 @@ class RSSCollector(BaseCollector):
     def fetch(self, source) -> list[CollectedItem]:
         resp = self.http_get(source.url)
         parsed = feedparser.parse(resp.content)
-        if parsed.bozo and not parsed.entries:
-            raise CollectorError(f"RSS 解析失败: {parsed.bozo_exception}")
+        # A response that is not a feed at all (captcha wall, login page, CDN
+        # interstitial, plain HTML) parses "successfully" into zero entries
+        # with no version. That must be an ERROR, not an empty feed —
+        # otherwise the source looks healthy while collecting nothing and
+        # consecutive_failures never rises, so the breakage stays invisible.
+        if not parsed.version and not parsed.entries:
+            raise CollectorError(
+                "响应不是有效的 RSS/Atom 订阅源（可能被验证码/登录墙拦截，"
+                "或返回了 HTML 页面）")
         items = []
         for e in parsed.entries:
             link = e.get("link", "")
@@ -34,6 +41,11 @@ class RSSCollector(BaseCollector):
                     break
             items.append(CollectedItem(
                 url=link, title=e.get("title", ""), content=content, published_at=published))
+        # A malformed feed (bozo) that yields no usable entry is a genuine
+        # failure: reporting success would silently drop the remaining items
+        # on every subsequent run.
+        if parsed.bozo and not items:
+            raise CollectorError(f"RSS 解析失败: {parsed.bozo_exception}")
         return items
 
 
