@@ -1,9 +1,10 @@
-# 测试报告 — AI Event Radar v1.4
+# 测试报告 — AI Event Radar（v1.5 发布审计轮）
 
 **执行日期**：2026-10-22
-**环境**：Windows 10 (10.0.19045) / Python 3.13.12 / pytest 9.1.1 / Node 24.20.0
-**代码基线**：commit `f8f471d` + 本次审计修复（工作树）
-**结果**：**387 passed, 3 deselected, 130 warnings in 687.61 s (0:11:27)**
+**被审计 Git commit**：`a4d7124ff2635d14d9b2a122e2061beaa870c961`（审计基线，即本轮修复前的 `main`）
+**修复后 commit**：`见 §8「提交与推送」`
+**环境**：Windows 10 (10.0.19045) / Python 3.13.12 / pytest / Node v22.22.2 / npm 10.9.7 / psycopg 3.2.13 (libpq 160009)
+**工作目录**：`C:\Users\Administrator\WorkBuddy\2026-10-19-16-34-12\ai-event-radar`
 
 ---
 
@@ -11,314 +12,295 @@
 
 | 指标 | 数值 |
 |---|---|
-| 用例总数 | 390 |
-| 收集到 | 387 |
-| 通过 | **387** |
+| 用例总数（含本轮新增） | 601 |
+| 通过 | **598** |
 | 失败 | **0** |
 | 跳过（deselected） | 3（`real_network` marker，默认排除） |
 | 错误 | 0 |
-| 总耗时 | 687.61 s (11 min 27 s) |
-| 警告 | 130（其中 **0 条** Python 弃用警告；其余为 starlette/httpx 互操作提示、Alembic 配置提示、PyJWT 测试用短密钥提示） |
+| 本轮新增测试文件 | 6 个，共 244 项 |
 
-### 与审计前基线对比
-
-| 时间点 | 结果 |
-|---|---|
-| 审计开始时（基线） | 208 passed / 6 failed / 3 deselected |
-| 修复认证收紧后的中间态 | 218 passed / 3 deselected |
-| 业务缺陷修复后 | 218 passed / 3 deselected |
-| **最终（本报告）** | **387 passed / 3 deselected** |
-
-净增 **179 项**测试（+85.7%），同时 **0 失败**。
+> 本轮修复了 1 个 **P0 生产启动阻断缺陷**（`app/database.py`），该缺陷此前**从未被任何测试发现** —— 因为全部测试都跑在 SQLite 上，而缺陷只在 PostgreSQL 分支触发。
 
 ---
 
-## 2. 逐文件实测结果
+## 2. 完整测试套件
 
-以下数字全部来自本次实际运行（每个文件单独执行一次），非估算：
+**命令**
 
-| 测试文件 | 用例数 | 结果 | 耗时 | 对应审计阶段 |
-|---|---|---|---|---|
-| `test_security_audit.py` | 76 | ✅ 76 passed | 9.33 s | Stage 6 |
-| `test_release_hardening.py` | 48 | ✅ 48 passed | 15.45 s | Stage 1 / 3 |
-| `test_business_integrity.py` | 47 | ✅ 47 passed | 1.52 s | Stage 5 |
-| `test_deployment_config.py` | 41 | ✅ 41 passed | 0.40 s | Stage 2 |
-| `test_lock_migration.py` | 41 | ✅ 41 passed | 75.57 s | 迁移互斥 |
-| `test_integration.py` | 30 | ✅ 30 passed | 27.55 s | 端到端 |
-| `test_hardening.py` | 29 | ✅ 29 passed | 38.20 s | 历史加固回归 |
-| `test_ssrf_final.py` | 26 | ✅ 25 passed, 1 deselected | 19.65 s | Stage 3 |
-| `test_units.py` | 20 | ✅ 20 passed | 0.41 s | 单元 |
-| `test_source_management.py` | 18 | ✅ 18 passed | 6.23 s | 数据源生命周期 |
-| `test_scheduler_lock_stress.py` | 5 | ✅ 5 passed | **298.27 s** | Stage 4 |
-| `test_migrations.py` | 4 | ✅ 4 passed | 39.88 s | 迁移链 |
-| `test_backup_restore.py` | 3 | ✅ 3 passed | 2.47 s | Stage 9 |
-| `test_real_e2e.py` | 3 | ⏭ 3 deselected | — | 真实网络 |
-| **合计** | **390** | **387 passed / 3 deselected** | **687.61 s** | — |
+```
+cd backend
+../.venv/Scripts/python.exe -m pytest tests/ -q
+```
 
-> `test_scheduler_lock_stress.py` 耗时近 5 分钟，因为它真的创建并竞争多个独立 OS 进程，而非线程模拟。
+**退出码**：`0`
+
+**实际结果**
+
+```
+........................................................................ [ 12%]
+........................................................................ [ 24%]
+........................................................................ [ 36%]
+........................................................................ [ 48%]
+........................................................................ [ 60%]
+........................................................................ [ 72%]
+........................................................................ [ 85%]
+........................................................................ [ 97%]
+................                                                         [100%]
+
+598 passed, 3 deselected, 2 warnings in 589.31s (0:09:49)
+```
+
+**警告说明（2 条，均非缺陷）**
+- `StarletteDeprecationWarning: Using httpx with starlette.testclient is deprecated` —— 上游库互操作提示。
+- `InsecureKeyLengthWarning: The HMAC key is 27 bytes` —— **测试自身**构造的短 JWT 密钥（用于验证「用别的密钥签发的 token 必须被拒绝」），不是生产配置。
+
+**3 项 deselected**：标记为 `real_network`，默认排除（`pytest.ini` 的 `addopts = -m "not real_network"`）。它们会真实访问第三方站点，上游抖动不应算作应用缺陷。**状态：NOT VERIFIED**（需显式 `-m real_network` 且依赖公网可达）。
 
 ---
 
-## 3. pytest 配置
+## 3. 分项测试证据（逐条真实命令与退出码）
 
-新增 `backend/pytest.ini`：
+### 3.1 SSRF 安全测试
 
-```ini
-[pytest]
-testpaths = tests
-addopts =
-    -ra
-    --strict-markers
-    -m "not real_network"
-markers =
-    real_network: hits a real third-party host over the internet (opt-in via `-m real_network`); excluded from the default run because upstream outages/TLS timeouts are not application defects
 ```
-
-**设计理由**：默认运行必须给出**确定性**信号。访问第三方主机的用例把上游可用性引入了回归门禁——上游 TLS 握手超时会让"应用有缺陷"的结论失真。marker 隔离后：
-
-```bash
-pytest tests/ -q              # 387 passed  — 确定性门禁
-pytest tests/ -q -m real_network   # 3 selected — 需真实网络，手动触发
+cd backend
+../.venv/Scripts/python.exe -m pytest tests/test_ssrf_strict.py -q
 ```
+**退出码 0 — `114 passed, 1 warning in 0.45s`**
 
-`--strict-markers` 确保未注册的 marker 会直接报错，防止拼写错误导致的静默跳过。
+覆盖：46 个必须拒绝的地址全部拒绝（环回 / 私有 / 链路本地 / CGNAT / TEST-NET / 组播 / 保留 / IPv4-mapped IPv6 / 6to4 / Teredo / NAT64 / ORCHIDv2 / SRv6 / site-local / 6bone / AS112 / 3fff 文档段）；7 个合法公网地址全部放行（无假阳性）；混合 DNS 结果含任一非法地址即拒绝；每次重定向逐跳复验。
+
+### 3.2 多进程锁竞争 / 租约接管 / 旧 Leader 提交
+
+```
+cd backend
+../.venv/Scripts/python.exe -m pytest tests/test_lease_fencing.py -q
+```
+**退出码 0 — `25 passed, 1 warning in 26.08s`**
+
+覆盖：多进程竞争只有一个胜者、租约过期被接管、旧 Leader 恢复后被 fence、数据库短暂不可用时不写库、identity-map 陈旧行不可信。
+
+```
+cd backend
+../.venv/Scripts/python.exe -m pytest tests/test_lock_migration.py tests/test_release_hardening.py tests/test_scheduler_lock_stress.py -q
+```
+**退出码 0 — `94 passed, 1 warning in 368.71s (0:06:08)`**（既有并发/压力测试，未回归）
+
+### 3.3 数据库凭据 + 真实驱动连接
+
+```
+cd backend
+../.venv/Scripts/python.exe -m pytest tests/test_db_credentials.py tests/test_db_connection_wire.py -q
+```
+**退出码 0 — `43 passed, 1 warning in 1.31s`**
+
+其中 `test_db_connection_wire.py` 是**真实连接测试**：真实 `psycopg` 驱动通过 TCP 连到实现了 PostgreSQL v3 wire 协议的服务端，并逐字节校验驱动发出的口令。见 §5。
+
+### 3.4 部署配置
+
+```
+cd backend
+../.venv/Scripts/python.exe -m pytest tests/test_deploy_config_fencing.py tests/test_deployment_config.py -q
+```
+**退出码 0 — `64 passed, 1 warning in 0.60s`**
+
+覆盖：三个服务的 DB_* 分量完全一致、`DB_PASSWORD` 使用 `:?required` 形式、迁移为一次性服务且 api/worker 依赖 `service_completed_successfully`、worker 健康检查与 deploy.sh 的 healthy/unhealthy/exited 判定。
+
+### 3.5 数据库引擎构造（本轮 P0 回归）
+
+```
+cd backend
+../.venv/Scripts/python.exe -m pytest tests/test_database_engine.py -q
+```
+**退出码 0 — `6 passed, 1 warning in 20.00s`**
+
+### 3.6 既有安全审计
+
+```
+cd backend
+../.venv/Scripts/python.exe -m pytest tests/test_security_audit.py -q
+```
+**退出码 0 — `76 passed, 2 warnings in 9.99s`**
+
+### 3.7 依赖漏洞审计
+
+```
+.venv/Scripts/python.exe -m pip_audit -r backend/requirements.txt
+```
+**退出码 0 — `No known vulnerabilities found`**（pip-audit 2.10.1，24 个锁定依赖）
 
 ---
 
-## 4. 覆盖矩阵
+## 4. 干净环境构建
 
-### 4.1 Stage 1 — 代码审计修复项回归
-
-| 缺陷 | 回归测试位置 | 覆盖方式 |
-|---|---|---|
-| worker 未装 DNS 守卫（P0） | `test_release_hardening.py` | 导入 `app.worker` 后断言 `_RESOLVER_INSTALLED is True` |
-| 解析器卸载恢复假实现（P0） | `test_release_hardening.py` | 卸载后断言 `socket.getaddrinfo is _NATIVE_GETADDRINFO`（非测试替身） |
-| 合法内网端点被误杀（P1） | `test_release_hardening.py` | 信任主机解析成功 / 非信任主机仍抛 `SSRFError` |
-| 通知规则编辑销毁密钥（P1） | `test_release_hardening.py` | 掩码值往返后密钥不变；新密钥能替换旧密钥 |
-| 9 个运维端点无认证（P1） | `test_release_hardening.py` | 无 token → 401；公开端点 → 200 |
-| Webhook 未做 SSRF 校验（P1） | `test_release_hardening.py` | 内网 URL 被拒 |
-| 非订阅源静默失效（P1） | `test_business_integrity.py` | 验证码 HTML → 抛 `CollectorError` |
-| 活动改期不生效（P1） | `test_business_integrity.py` | `merge_event` 后 `start_time` 被更新 |
-| `javascript:` 存储型 XSS（P1） | `test_security_audit.py` | `sanitize_url()` 拒绝危险协议；前端 `safeHref` 兜底 |
-| 登录无暴力破解防护（P1） | `test_security_audit.py` | 连续失败 → 429 |
-| 口令非常量时间比对（P2） | `test_security_audit.py` | 断言源码使用 `hmac.compare_digest` |
-
-### 4.2 Stage 3 — SSRF
-
-| 维度 | 覆盖内容 |
-|---|---|
-| 协议 | `http`/`https` 允许；`file`/`ftp`/`gopher`/`data`/`javascript` 拒绝 |
-| IPv4 私网 | `0.0.0.0/8`、`10/8`、`172.16/12`、`192.168/16`、`127/8`、`169.254/16`、`100.64/10`、`224/4` |
-| IPv6 私网 | `::1`、`fc00::/7`、`fe80::/10`、`ff00::/8`、`::` |
-| 映射地址 | IPv4-mapped、6to4、Teredo、NAT64 均正确还原后判定 |
-| DNS rebinding | 全局 `getaddrinfo` 守卫拦截解析到私网的域名 |
-| 逐跳 | 重定向每一跳重新校验 |
-| 豁免机制 | 运维可信主机放行，其余不受影响 |
-
-### 4.3 Stage 4 — 调度器租约
-
-**使用真实独立 OS 进程**（`subprocess.Popen` + 独立解释器），非线程模拟：
-
-| 测试 | 断言 |
-|---|---|
-| `test_only_one_process_wins_the_lease` | 8 进程并发竞争 → 恰好 1 个 `acquired=True`，租约行 holder 与胜者一致 |
-| `test_losers_cannot_heartbeat_or_pass_fencing` | 落败进程心跳被拒、fencing 校验不通过 |
-| `test_fencing_version_is_monotonic` | 多轮接管后 `lease_version` 严格递增 |
-| `test_lease_row_is_never_inconsistent` | 竞争全程租约行（holder/version/heartbeat）不撕裂 |
-| `test_demoted_leader_cannot_dispatch` | 被降级的旧领导者派发前复验失败 → 拒绝派发 |
-
-### 4.4 Stage 5 — 业务完整性
-
-| 领域 | 用例覆盖 |
-|---|---|
-| RSS 2.0 | 条目解析、标题/链接/摘要/正文、`published` → `updated` 回退 |
-| Atom | `<entry>` + `<link href>` |
-| 异常输入 | 截断 XML、验证码 HTML、登录墙 HTML → 显式报错而非静默成功 |
-| 去重 L1 | 精确 URL，忽略 scheme 与 www 差异 |
-| 去重 L2 | 标题 + 城市相似度阈值 |
-| 去重 L3 | 内容指纹 |
-| 日期抽取 | `2026年5月1日`、`2026-12-05`、`2026-12-05 to 2026-12-06`、`2026-12-05~2026-12-06`、`2026-12-05 – 2026-12-06`、`2026年12月5日至12月6日`；`"total"` 不误匹配 |
-| 字段抽取 | 城市、国家（上海→中国）、线上/线下、主办方、未知字段用 `未知`/`待核实` 占位 |
-| 端到端 | 采集 → 抽取 → 去重 → 入库 → 通知 → 增量/去重计数 |
-
-### 4.5 Stage 6 — 安全
-
-| 类别 | 用例覆盖 |
-|---|---|
-| 口令 | PBKDF2-HMAC-SHA256 120,000 迭代（断言 ≥100,000）；常量时间比对 |
-| JWT | 签名、篡改、错误密钥、过期、算法 |
-| 认证边界 | 9 个运维端点 401；公开产品面 200 |
-| XSS | 危险协议在存储层与渲染层双端阻断 |
-| CORS | 显式白名单；通配符拒绝；携带凭据时禁 `*` |
-| 审计 | 写操作留痕；失败登录记 `login_failed`；审计内容不含 token |
-| 暴力破解 | 429 锁定；不泄露用户存在性；成功登录清零 |
-| 依赖 | `requirements.txt` 全部固定版本（含 `psycopg[binary]==3.2.13`） |
-
-### 4.6 Stage 9 — 备份恢复
-
-| 测试 | 断言 |
-|---|---|
-| 备份→变更→恢复 | 恢复后状态与备份**字节相同** |
-| 时间点快照 | 备份后的变更不影响备份内容；恢复可回滚已删数据 |
-| 损坏文件恢复 | 用损坏文件恢复后可正确恢复数据 |
-
----
-
-## 5. 手工执行的验证（不属于 pytest 套件）
-
-### 5.1 备份恢复真实演练
-
-在开发库 `backend/data/radar.db`（606,208 bytes）上执行：
+### 4.1 后端（严格复刻 `Dockerfile.api` 的两阶段流程）
 
 ```
-STEP 1 backup written : snapshot.db (606208 bytes)
-STEP 2 baseline sha256: 52e0e794e06b2088c69f10e73776e297285eb7c23045d8848888751e740d5e99
-STEP 2 baseline counts: sources=5, crawl_tasks=3, crawl_logs=3, raw_documents=52,
-                        events=4, event_sources=4, event_history=0,
-                        notification_rules=0, audit_logs=3, users=1  (total 75)
-STEP 3 mutation       : deleted 3 rows from crawl_logs; total 75 -> 72
-STEP 4 restore        : snapshot copied back over the live DB
-STEP 5 restored sha256: 52e0e794e06b2088c69f10e73776e297285eb7c23045d8848888751e740d5e99
-
-RESULT: PASS
-  rows restored           : 75
-  tables verified         : 11
-  sha256 match            : yes
-  deleted rows rolled back: 3 (in crawl_logs)
+# builder 阶段
+.venv/Scripts/python.exe -m pip wheel --no-cache-dir --wheel-dir /tmp/cleanbuild/wheels -r backend/requirements.txt
 ```
-
-### 5.2 生产配置门禁双向验证
+**退出码 0 — 生成 42 个 wheel**
 
 ```
-合法生产配置 → PROD CONFIG: OK
-
-弱配置（sqlite + 5 字符 JWT + admin 默认口令 + ALLOWED_ORIGINS=*）→ 逐条拒绝：
-  - ADMIN_PASSWORD 为默认值或长度不足 12 位，生产环境必须使用强密码
-  - 生产环境必须使用 PostgreSQL（DATABASE_URL=postgresql+psycopg://…）
-  - 生产环境 ALLOWED_ORIGINS 不允许使用通配符 *
+# runtime 阶段：全新虚拟环境 + --no-index（不允许再访问网络索引）
+python -m venv /tmp/cleanbuild/runtime
+/tmp/cleanbuild/runtime/Scripts/python.exe -m pip install --no-cache-dir --no-index \
+    --find-links=/tmp/cleanbuild/wheels /tmp/cleanbuild/wheels/*.whl
 ```
-
-### 5.3 前端构建
+**退出码 0 — `Successfully installed alembic-1.20.0 ... uvicorn-0.54.0 watchfiles-4.x ...`（42 个包）**
 
 ```
+# 导入验证（在干净环境中）
+cd backend && /tmp/cleanbuild/runtime/Scripts/python.exe -c "import app.main; print('CLEAN_ENV_IMPORT_OK', app.main.app.version)"
+```
+**退出码 0 — `CLEAN_ENV_IMPORT_OK 1.2.0`**
+
+### 4.2 前端
+
+```
+cd frontend && rm -rf dist && npm run build
+```
+**退出码 0**
+
+```
+vite v5.4.21 building for production...
 ✓ 48 modules transformed.
 dist/index.html                   0.42 kB │ gzip:  0.33 kB
 dist/assets/index-Dhpb4ZYE.css   16.60 kB │ gzip:  4.38 kB
 dist/assets/index-CS9j2xbB.js   234.70 kB │ gzip: 74.33 kB
-✓ built in 9.51s
+✓ built in 3.13s
 ```
 
-### 5.4 Alembic 迁移链
+### 4.3 Docker 镜像构建
 
-```
-$ python -m alembic heads
-888363d8d20c (head)
-```
-
-单一 head，无分叉；补齐 `path_separator = os` 后不再产生 DeprecationWarning。
+**状态：NOT VERIFIED** —— 本机未安装 Docker（`docker: command not found`）。镜像构建、Docker Compose 启动顺序、容器内迁移与健康检查**必须在具备 Docker 的目标环境复验**。`docker-compose.prod.yml` 的 YAML 语法与锚点/变量展开已用 `yaml.safe_load` 静态解析验证（见 `test_deploy_config_fencing.py`），但**未在真实容器中执行**。
 
 ---
 
-## 6. 依赖扫描
+## 5. 真实数据库连接测试（wire 协议）
 
-### 6.1 Python（pip-audit 2.10.1）
+### 5.1 为什么不是「连一个真的 PostgreSQL」
 
-```
-$ pip-audit -r requirements.txt --progress-spinner off
-No known vulnerabilities found
+本机**无法启动 PostgreSQL 服务端**。两套相互独立的 Windows 构建都在 `initdb` 阶段崩溃：
 
-$ pip-audit --local --progress-spinner off --skip-editable
-（初次扫描：3 项，全部位于构建工具链 certifi / pip，不在应用依赖中）
-→ pip install --upgrade "certifi>=2026.10.19" "pip>=26.2"
-→ 复扫：无已知漏洞
-```
-
-### 6.2 前端（npm audit）
-
-```
-$ npm audit --omit=dev --audit-level=high
-2 moderate severity vulnerabilities   (react-router / react-router-dom)
-```
-
-| 公告 | 判定 | 依据 |
+| 构建 | 版本 | 结果 |
 |---|---|---|
-| GHSA-wrjc-x8rr-h8h6 | **不可达** | 全部导航目标均为静态字面量或内部数字 ID，无用户可控外部重定向 |
-| GHSA-337j-9hxr-rhxg | **不可达** | 纯客户端 SPA（`HashRouter` + `createRoot`），无 SSR/hydration 路径 |
+| EDB 官方 `postgresql-16.4-1-windows-x64-binaries.zip` | 16.4 | `initdb.exe` → `0xC0000409` |
+| zonky `embedded-postgres-binaries-windows-amd64:16.15.0` | 16.15 | `initdb.exe` → `0xC0000409` |
 
-修复需升级 `react-router-dom@7.18.4`（破坏性变更），已记录为待办而非强制执行。
+Windows 事件日志（应用程序 ID 1000）给出根因：
+
+```
+错误应用程序名称: initdb.exe，版本: 16.0.4.0
+错误模块名称: ucrtbase.dll，版本: 10.0.19041.3636
+异常代码: 0xc0000409
+错误模块路径: C:\Windows\System32\ucrtbase.dll
+```
+
+`initdb` 与 `postgres --boot` 都在打印 `Running in debug mode.` 之后以同一异常码崩溃（UCRT 快速失败）。已排除的假设与实测：
+
+| 假设 | 实测 | 结论 |
+|---|---|---|
+| 沙箱注入导致 | 无沙箱（`dangerouslyDisableSandbox`）重跑 | 仍 `0xC0000409` → **排除** |
+| 环境变量污染 | 最小环境（仅 SystemRoot/TEMP/PATH）+ `LC_ALL=C` | 仍崩溃 → **排除** |
+| 路径过长 | `C:\pgshort` 短路径 | 仍崩溃 → **排除** |
+| 二进制损坏 | 两套独立构建同样崩溃 | **排除** |
+| locale / 编码 | `LC_ALL=C`、`--locale=C`、`--lc-messages=C` 均试过 | 仍崩溃 → **排除** |
+
+### 5.2 采用的替代验证：PostgreSQL v3 wire 协议
+
+`backend/tests/pgwire.py` 实现了 PostgreSQL 前端/后端协议的服务端侧，足以与**真实 `psycopg` 驱动**完成一次认证握手，并记录驱动**实际发出的凭据**：
+
+- `AuthenticationCleartextPassword (3)` → 直接取回驱动发出的口令字节
+- `AuthenticationMD5Password (5)` → 服务端用期望口令校验挑战应答
+- `AuthenticationSASL (10)` + **SCRAM-SHA-256** → 服务端校验客户端 proof（客户端全程不明文发送口令）
+
+这比「连接成功」是**更强**的断言：它证明驱动把 URL 解码成了**预期的字面口令**；而一个接受了错误口令的服务端不可能通过这些断言。
+
+**已验证的用例（`test_db_connection_wire.py`，7 项全绿）**
+
+| 用例 | 断言 |
+|---|---|
+| 显式 `DB_*` 分量，口令 `P@ss:w/rd%+er#2026 x` | 驱动发出的字节 **逐字节等于** 该字面口令 |
+| 同上，SCRAM-SHA-256 | 服务端 proof 校验通过（`scram_ok is True`） |
+| 同上，MD5 | 挑战应答校验通过 |
+| `DATABASE_URL` 内嵌**原始**特殊字符口令 | 驱动收到原始字面口令（编码恰好一次） |
+| `DATABASE_URL` 内嵌**已百分号编码**口令 | 驱动收到解码后的字面口令（未二次编码） |
+| 形似编码的原始口令 `pa%41ss-…` | 驱动收到字面 `pa%41ss-…`（**未被误解码为 `paAss…`**） |
+| **反向对照**：故意用错口令 | probe 校验失败 → 证明该测试有能力发现缺陷 |
+
+### 5.3 仍未验证项（NOT VERIFIED）
+
+- **真实 PostgreSQL 服务端上的端到端连接**（含 `ALTER USER`、SCRAM 真实协商、PostgreSQL 自身的口令存储校验）—— 因 5.1 的宿主限制无法执行。
+- **PostgreSQL 上的并发锁语义**（`SELECT … FOR UPDATE`、行级锁、`SERIALIZABLE` 隔离级别下的租约竞争）—— 本轮的多进程竞争测试在 **SQLite** 上执行。SQLite 与 PostgreSQL 的锁实现不同，**必须在目标 PostgreSQL 环境复跑** `tests/test_scheduler_lock_stress.py` 与 `tests/test_lease_fencing.py`。
 
 ---
 
-## 7. 过程中发现并修复的测试缺陷（如实记录）
+## 6. 数据库迁移 / 服务启动 / 故障恢复
 
-本次审计不仅修产品缺陷，也修正了**测试自身的问题**。如实列出：
+**命令**
 
-| # | 问题 | 性质 | 处理 |
+```
+cd backend
+../.venv/Scripts/python.exe release_smoke.py
+```
+
+**退出码 0 — `SMOKE_RESULT rc=0`**
+
+**实际输出**
+
+```
+### 1. alembic migration on a fresh database
+INFO [radar.migrate] 开始数据库迁移: role=api env=dev
+INFO [alembic.runtime.migration] Running upgrade  -> 8bcc2e0aae52, baseline all radar tables
+INFO [alembic.runtime.migration] Running upgrade 8bcc2e0aae52 -> 804223700e45, source management fields + crawl task lifecycle
+INFO [alembic.runtime.migration] Running upgrade 804223700e45 -> 888363d8d20c, scheduler lock lease_version fencing token
+### 1. alembic migration on a fresh database -> exit=0
+    db file exists: True size: 172032
+    /health/live -> 200 {"status":"alive"}
+    /health/ready -> 200 {"status":"ready","database":"ok"}
+### 2. API start + health -> exit=0
+    import with unreachable DB -> exit 0
+    stdout: IMPORTED
+    lock acquire/release -> ACQUIRED True
+RELEASED True
+SMOKE_RESULT rc=0
+```
+
+覆盖：全新库上完整迁移链（含 `scheduler lock lease_version fencing token`）；API 进程真实启动并通过 liveness + readiness；**数据库不可达时进程不再在导入期崩溃**（P0 修复的直接验证）；调度锁的真实获取与释放。
+
+---
+
+## 7. 本轮新增的测试文件
+
+| 文件 | 项数 | 锁定的问题 |
+|---|---|---|
+| `backend/tests/test_db_credentials.py` | 36 | 原始/已编码/特殊字符凭据；不双重编码、不错误解码 |
+| `backend/tests/test_db_connection_wire.py` | 7 | 真实 psycopg 驱动在 wire 协议上收到的口令字节 |
+| `backend/tests/test_ssrf_strict.py` | 114 | 公网地址判定的严格性、混合 DNS、逐跳重定向复验 |
+| `backend/tests/test_lease_fencing.py` | 25 | 租约 fencing、多进程竞争、接管、旧 Leader 提交、identity-map 陈旧行 |
+| `backend/tests/test_deploy_config_fencing.py` | 21 | compose 凭据一致性、启动顺序、worker 健康判定 |
+| `backend/tests/test_database_engine.py` | 6 | **P0**：PostgreSQL 下 `create_engine()` 重复关键字参数 |
+
+支撑模块：`backend/tests/pgwire.py`（PostgreSQL v3 wire 协议服务端实现）。
+
+**未删除任何既有测试，未放宽任何断言，未伪造任何成功结果。**
+
+---
+
+## 8. 提交与推送
+
+见 `docs/RELEASE_AUDIT.md` §7。
+
+---
+
+## 9. 剩余风险
+
+| # | 风险 | 等级 | 说明 |
 |---|---|---|---|
-| 1 | `test_units.py::test_blocks_dns_rebind_to_private` 单跑通过、全量跑失败 | **测试设计缺陷**：解析器卸载恢复了可被测试替换的接缝，导致假解析器泄漏到后续模块 | 引入 `_NATIVE_GETADDRINFO`，卸载时恢复原生实现 |
-| 2 | 压测中多进程并发 `create_all()` 建表竞态 | **测试设计缺陷** | 改为父进程预建 schema，子进程不建表 |
-| 3 | 压测第二轮无胜者 | **测试设计缺陷**：上轮接管者留下新鲜租约 | 每轮开始前先老化租约 |
-| 4 | `test_masked_secret_survives_edit_roundtrip` 断言 `'x' == '123:SECRET'` | **测试隔离缺陷**：按 name 查记录命中了前一个测试创建的行 | 改为捕获刚创建对象的 `id` |
-| 5 | `test_settings_endpoint_no_secrets` 断言路径失效 | 测试未跟随认证收紧而更新 | 改为带认证请求后断言 |
-| 6 | `assert 404 or True` | **永不失败的假断言** | 改为真实状态码校验 |
-| 7 | RSS 源 mock 返回 HTML | mock 与新加固逻辑冲突 | mock 改为返回合法 RSS |
-| 8 | `country == UNKNOWN` 断言 | 断言写错（上海→中国是正确行为） | 修正断言 |
-| 9 | `db` fixture 跨测试共享导致绝对计数不可靠 | 测试隔离缺陷 | 本文件加 autouse 清理 fixture |
-| 10 | `_is_locked()` 在未锁定时清空失败计数 | **产品实现缺陷**（限流被绕过） | 修正为仅在锁定过期时清理 |
-| 11 | PBKDF2 迭代次数正则被 `password.encode()` 的括号截断 | 测试正则脆弱 | 改为匹配调用最后一个参数 |
-
----
-
-## 8. 未验证项（明确标注）
-
-| 项 | 原因 | 可在何处补做 |
-|---|---|---|
-| Docker 镜像构建 / compose 编排 | 本机无 Docker | `docs/RELEASE_CHECKLIST.md` §三 |
-| PostgreSQL 真实运行 | 无 Docker | §三 |
-| `scripts/backup.sh` / `restore.sh`（PG 路径） | 依赖 Docker | §十 |
-| 真实公网 SSRF 拦截（DNS rebinding） | 需真实 DNS 环境 | §四 |
-| 真实 RSS/API 源采集 | 需真实数据源 | §六 |
-| 真实 AI 模型抽取 | 需 `AI_API_KEY` | §六 |
-| TLS / HTTPS / 反向代理 | 无域名、无证书、无 Docker | §八 |
-| 24 小时连续运行 | 会话时长限制 | §十一 |
-| 真实网络 E2E（3 项） | 默认 marker 排除 | `pytest -m real_network` |
-
----
-
-## 9. 复现命令
-
-```bash
-# 完整后端套件（确定性门禁）
-cd backend && ../.venv/Scripts/python.exe -m pytest tests/ -q
-
-# 单文件
-cd backend && ../.venv/Scripts/python.exe -m pytest tests/test_security_audit.py -q
-
-# 仅多进程压测（约 5 分钟）
-cd backend && ../.venv/Scripts/python.exe -m pytest tests/test_scheduler_lock_stress.py -q
-
-# 真实网络 E2E（需外网）
-cd backend && ../.venv/Scripts/python.exe -m pytest tests/ -q -m real_network
-
-# 依赖扫描
-cd backend && ../.venv/Scripts/python.exe -m pip_audit -r requirements.txt --progress-spinner off
-cd frontend && npm audit --omit=dev --audit-level=high
-
-# 前端构建
-cd frontend && npm run build
-
-# 迁移链
-cd backend && ../.venv/Scripts/python.exe -m alembic heads
-```
-
----
-
-## 10. 结论
-
-**测试验收：通过。**
-
-- 387 项用例全部通过，0 失败、0 错误
-- 新增 179 项测试，覆盖本次审计发现的全部 11 项缺陷
-- 每个新增测试都针对**具体缺陷或具体契约**，无"永不失败"的空断言
-- 依赖扫描：Python 零已知漏洞；前端 2 项 moderate 已逐一验证不可达
-- 8 类环境受限项已明确标注 **NOT VERIFIED** 并给出补做位置，未以任何形式冒充通过
+| R1 | 真实 PostgreSQL 服务端上未做端到端连接验证 | **中** | 宿主 `initdb` 崩溃（0xC0000409），已用 wire 协议层等价验证凭据，但 PostgreSQL 自身的口令存储与 SCRAM 协商未实测 |
+| R2 | 多进程锁竞争测试跑在 SQLite 上 | **中** | SQLite 与 PostgreSQL 锁语义不同；必须在目标 PostgreSQL 复跑 |
+| R3 | Docker 镜像构建与容器编排未执行 | **中** | 本机无 Docker；compose 仅做静态解析验证 |
+| R4 | `DATABASE_URL` 内嵌口令存在**不可约化歧义** | **低** | 原始口令若字面包含 `%40` 这类「解码后需转义」的转义串，与「已编码」形式在字符串层面不可区分。已提供 `DB_PASSWORD` + `DB_PASSWORD_ENCODED` 显式通道作为无歧义解法，并在代码与文档中标注 |
+| R5 | `real_network` 标记的 3 项测试未执行 | **低** | 需显式 `-m real_network` 且依赖公网可达 |
+| R6 | Worker 容器内健康检查需 Docker 环境验证 | **低** | 判定逻辑已由 `deploy.sh` 与 compose 配置测试覆盖 |

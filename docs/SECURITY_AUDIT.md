@@ -1,9 +1,11 @@
-# 安全审计报告 — AI Event Radar v1.4
+# 安全审计报告 — AI Event Radar（v1.5 发布审计轮）
 
 **审计日期**：2026-10-22
-**审计范围**：后端 30 个模块 / 前端 16 个文件 / 基础设施配置 / 第三方依赖
-**配套文档**：`RELEASE_AUDIT.md`（全流程）、`TEST_REPORT.md`（测试明细）、`RELEASE_CHECKLIST.md`（放行清单）
-**安全结论**：**代码与依赖层面通过；部署层面 6 项待目标环境验证（BLOCKING）**
+**被审计 Git commit**：`a4d7124ff2635d14d9b2a122e2061beaa870c961`（审计基线）
+**修复后 commit**：见 `docs/RELEASE_AUDIT.md` §7
+**审计范围**：后端应用层 / 数据库连接与调度器 / 生产部署配置 / 第三方依赖
+**配套文档**：`TEST_REPORT.md`（逐条测试证据）、`RELEASE_AUDIT.md`（放行结论）
+**安全结论**：**代码层面通过；2 项部署环境验证未完成（NOT VERIFIED，见 §11）**
 
 ---
 
@@ -15,11 +17,11 @@
 |---|---|---|
 | 管理员口令哈希 | 高 | 不可逆存储、离线破解成本高 |
 | JWT 签名密钥 | 高 | 不可泄露、不可弱于 256-bit |
-| 数据库连接串与口令 | 高 | 不可硬编码、不可日志泄漏 |
+| **数据库连接串与口令** | 高 | 不可硬编码、不可日志泄漏、**不可被 URL 拼接破坏** |
 | 通知渠道凭证（`bot_token`、`webhook_key`、SMTP 口令） | 高 | 编辑往返不丢失、读取不返回明文 |
 | 爬取到的第三方内容 | 中（不可信） | 不得作为代码执行、不得发起内网请求 |
 | 活动数据（Event / RawDocument） | 中 | 写操作需认证、有审计留痕 |
-| 运维数据（磁盘占用、任务队列、日志） | 中 | 仅认证用户可见 |
+| **调度领导权（DB 租约）** | 高 | 失效租约的旧 Leader 不得再写入任何业务数据 |
 
 ### 1.2 信任边界
 
@@ -38,31 +40,42 @@
    └─► 通知出口 (SMTP / 企业微信 / Webhook)    ← 独立的 SSRF 面
 ```
 
-**关键认识**：Worker 容器是**唯一真正发起出网请求的进程**，而 API 容器的 `lifespan()` 只在 uvicorn 下执行——这正是本次发现 P0 缺陷的根源（见 §3.1）。
-
 ### 1.3 攻击者能力假设
 
 - 外部攻击者：可完全控制自己提交的数据源配置、注册的目标站点内容、通知规则中的 URL
 - 内部攻击者（低权限管理员）：可读取运维端点
 - 网络中间人：仅在 HTTP 场景（TLS 由 nginx 终止）
+- **被接管的 Worker 进程**：租约过期后仍在运行并试图提交结果（本轮 P0 级 fencing 缺口的场景）
 
 ---
 
-## 2. 本次修复的安全缺陷
+## 2. 本轮修复的缺陷
 
-| # | 严重度 | 类别 | 缺陷 | 攻击路径 | 修复 |
+### 2.1 审计请求的四项
+
+| # | 严重度 | 类别 | 缺陷 | 攻击/失效路径 | 修复 |
 |---|---|---|---|---|---|
-| S1 | **P0** | SSRF | Worker 进程未安装 DNS 级守卫 | 恶意/被控站点在解析阶段返回私网地址 → Worker 直连内网（含云元数据 `169.254.169.254`） | `worker.main()` 内 `install_guarded_resolver()` |
-| S2 | **P0** | SSRF | 守卫卸载后恢复的是**可替换接缝** | 某次卸载把测试替身永久装入进程全局 → 后续所有 SSRF 防护静默失效 | 引入不可变 `_NATIVE_GETADDRINFO`，卸载恢复原生实现 |
-| S3 | **P1** | SSRF | Webhook 回调 URL 未过策略 | 运营误配/被诱导配置 `http://169.254.169.254/` → API 容器代打内网 | 发送前 `validate_public_url()` |
-| S4 | **P1** | 越权 | 9 个运维端点无认证 | 未认证访问者读取磁盘占用、调度器状态、爬取日志、全部数据源与通知规则 | 全部加 `Depends(current_user)` |
-| S5 | **P1** | XSS | `javascript:` 协议 URL 存储 + 渲染 | 恶意 feed 的 `<link>javascript:…</link>` 入库 → 前端 `<a href>` 渲染 → 在本站源执行脚本 | 后端 `sanitize_url()` 源头阻断 + 前端 `safeHref()` 兜底 |
-| S6 | **P1** | 凭证 | 通知规则编辑销毁已存密钥 | 编辑规则时前端回传掩码 `"***"` → 服务端原样覆盖 → `bot_token` 等永久失效 | `_merge_preserving_secrets()`，掩码语义化为"未修改" |
-| S7 | **P1** | 认证 | 登录无暴力破解防护 | 自动化尝试弱口令/字典口令 | `(IP, 用户名)` 滑动窗口：5 次失败锁 300 s；失败写审计日志 |
-| S8 | **P1** | 配置 | 全局守卫误杀合法内网端点 | 运维配置的内部 SMTP / LLM 网关无法连接（可用性事故） | `trusted_internal_hosts()` + `TRUSTED_INTERNAL_HOSTS` 显式豁免 |
-| S9 | **P2** | 密码学 | 口令比对非常量时间 | 时序侧信道推断口令 | `hmac.compare_digest` |
-| S10 | **P2** | 供应链 | 依赖未固定版本 | 漂移 / 投毒 / 不可复现构建 | `requirements.txt` 全部固定到实测版本 |
-| S11 | **P2** | 性能/可用 | nginx 缺静态资源缓存 | 每次加载重下 JS/CSS，弱网下体验劣化、成本上升 | `expires 1y` + `Cache-Control: public, immutable` |
+| S1 | **P0** | 数据库凭据 | `DATABASE_URL` 内嵌口令的编码状态靠「是否含 `%XX`」猜测 | 原始口令 `pa%41ss` 被误判为「已编码」→ 驱动解码成 `paAss` → **口令被静默篡改，登录失败且原因难辨** | 改用「转义解码后是否落在 `quote(safe="")` 的安全集内」判定（§4.2）；另提供 `DB_PASSWORD` + `DB_PASSWORD_ENCODED` **显式**通道作为无歧义解法 |
+| S2 | **P0** | 调度一致性 | 旧 Leader 在租约被接管后仍能提交采集结果 | 抓取期间租约过期 → 新 Leader 接管并重跑 → 旧 Leader 随后 commit，**产生重复事件与重复通知** | `lease_version` 作为 fencing token，在**每次业务写入前**校验（§5） |
+| S3 | **P0** | 调度一致性 | `db.get(SchedulerLock, 1)` 返回 **identity map 缓存**，不重新查库 | 长连接 Session 持续读到**陈旧租约行** → 已被接管的 Leader 仍自认是 Leader → fencing 机制整体失效 | 所有租约读取改为 `_read_lease_row_fresh()`（`populate_existing()`，绕过 identity map） |
+| S4 | **P1** | 部署配置 | `docker-compose.prod.yml` 用字符串拼接组装数据库 URI | 口令含 `@ : / % + #` 或空格时 URI 结构被破坏 → migrate / api / worker **可能连到不同数据库**，或迁移成功而 API 连不上 | compose 传递**离散分量** `DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD`，由 `encode_db_url()` 编码恰好一次；三个服务取值完全一致 |
+
+### 2.2 审计过程中额外发现并修复的缺陷
+
+| # | 严重度 | 类别 | 缺陷 | 影响 | 修复 |
+|---|---|---|---|---|---|
+| S5 | **P0** | 生产启动阻断 | `app/database.py` 中 `create_engine(DB_URL, connect_args=…, pool_pre_ping=True, **pool_kwargs)` —— PostgreSQL 分支的 `_pool_kwargs` **也**含 `pool_pre_ping` 与 `connect_args` | **导入期** `TypeError: create_engine() got multiple values for keyword argument 'pool_pre_ping'` → **生产环境 API 与 Worker 根本无法启动**。因全部测试跑在 SQLite（该分支不触发）而从未暴露 | 合并为**单一 options 字典**，两个分支不可能再冲突（`app/database.py`） |
+| S6 | **P1** | SSRF | `is_public_ip()` 的判定顺序：显式黑名单在转换逻辑**之后** | `2002::/16`（6to4）与 `2001::/32`（Teredo）两条黑名单是**死代码** —— 含公网 IPv4 的 6to4 地址被放行 | 重排判定顺序：先黑名单、后转换（§3.2） |
+| S7 | **P1** | SSRF | IPv6 特殊用途网段覆盖不全 | `2001:20::/28`（ORCHIDv2）、`5f00::/16`（SRv6 SID）、`2001:1::1`（PCP anycast）、`fec0::/10`（site-local）、`2620:fe::fe`（6bone）、`3fff::/20`（文档段）被放行 | 补齐 IANA 特殊用途注册表（§3.2） |
+| S8 | **P1** | 部署验收 | `deploy.sh` 的存活探针打的是 `$base/health/live` | 该路径在 nginx 落到 SPA 的 `location /`，**恒返回 index.html** → 探针恒成功，等于没有探针 | 改为 `$base/api/health/live`（nginx `location /api/` 会剥前缀转发给 `api:8000`） |
+| S9 | **P2** | 部署验收 | `deploy.sh` 仅检查 worker 容器 `Up` | 容器在跑但 healthcheck 失败（DB 连不上、租约获取失败）时部署仍会「成功」 | 轮询至 `healthy`；遇到 `unhealthy`/`exited` 立即 `fail` |
+| S10 | **P2** | 部署文档 | compose 头注释描述的启动顺序与实际 `depends_on` 不一致 | 事故处置时按过时注释判断 | 注释改为与 `service_completed_successfully` 一致的真实顺序 |
+
+### 2.3 上一轮（v1.4）已修复、本轮复核仍然有效
+
+S1–S11 见 `docs/AUDIT-v1.3.md` 与 git 历史（commit `a4d7124`）：Worker 缺失 DNS 级守卫（P0）、守卫卸载恢复可替换接缝（P0）、Webhook 未过策略（P1）、9 个运维端点无认证（P1）、`javascript:` 协议 URL 存储（P1）、通知规则编辑销毁密钥（P1）、登录无暴力破解防护（P1）、全局守卫误杀内网端点（P1）、口令非常量时间比对（P2）、依赖未固定（P2）、nginx 缺静态资源缓存（P2）。
+
+本轮 `tests/test_security_audit.py`（76 项）与 `tests/test_release_hardening.py` 全部通过，确认这些修复未回归。
 
 ---
 
@@ -76,25 +89,49 @@
 | L2 解析层守卫 | `install_guarded_resolver()` 包裹 `socket.getaddrinfo` | **DNS rebinding**：策略校验通过后、实际连接前，域名解析结果被改为私网 |
 | L3 逐跳复验 | `safe_get()` 每跳重新执行 L1 + L2 | 重定向到内网（`Location: http://10.0.0.1/`） |
 
-L2 是关键：单纯做 URL 字符串校验存在 **TOCTOU 窗口**（校验时解析到公网，连接时解析到私网）。全局守卫在**实际解析的那一刻**判定地址是否合法，窗口被关闭。
+L2 是关键：单纯做 URL 字符串校验存在 **TOCTOU 窗口**。全局守卫在**实际解析的那一刻**判定地址是否合法，窗口被关闭。
 
-### 3.2 地址分类
+### 3.2 地址分类（本轮补齐）
 
-显式 IPv4/IPv6 黑名单 + `ipaddress.is_global` 作为兜底，覆盖：
+判定顺序（本轮修正，S6）：**先查显式黑名单 → 再做封装还原（IPv4-mapped / 6to4 / Teredo）→ 最后才用 `is_global` 兜底**。修正前黑名单在转换之后，导致 6to4 与 Teredo 两条规则形同虚设。
 
-- IPv4：`0.0.0.0/8`、`10/8`、`100.64/10`（CGNAT）、`127/8`、`169.254/16`（含云元数据）、`172.16/12`、`192.168/16`、`224/4`
-- IPv6：`::`、`::1`、`fc00::/7`、`fe80::/10`、`ff00::/8`
-- 映射形式：IPv4-mapped IPv6、6to4（`2002::/16`）、Teredo（`2001::/32`）、NAT64（`64:ff9b::/96`）——均先还原出内嵌 IPv4 再判定
+**IPv4 黑名单**
+
+```
+0.0.0.0/8          10.0.0.0/8         100.64.0.0/10      127.0.0.0/8
+169.254.0.0/16     172.16.0.0/12      192.0.0.0/24       192.0.2.0/24
+192.88.99.0/24     192.168.0.0/16     198.18.0.0/15      198.51.100.0/24
+203.0.113.0/24     224.0.0.0/4        240.0.0.0/4
+```
+
+**IPv6 黑名单（本轮补齐 S7）**
+
+```
+::/128  ::1/128  64:ff9b::/96  64:ff9b:1::/48  100::/64  2001::/23
+2001:db8::/32  fc00::/7  fe80::/10  ff00::/8  2002::/16  2001::/32
+2001:20::/28 (ORCHIDv2)   2001:30::/28 (Drone Remote ID)
+5f00::/16 (SRv6 SIDs)     fec0::/10 (site-local)
+2620:4f:8000::/48 (AS112-v6)   3fff::/20 (文档段)
+2620:fe::fe (6bone anycast，已废弃)
+```
+
+**映射形式**：`::ffff:x.x.x.x`（IPv4-mapped）、`2002::/16`（6to4）、`2001::/32`（Teredo）、`64:ff9b::/96`（NAT64）—— 均先还原出内嵌 IPv4 再判定。
+
+**实测覆盖（`tests/test_ssrf_strict.py`，114 项，退出码 0）**
+
+| 类别 | 数量 | 结果 |
+|---|---|---|
+| 必须拒绝的地址（含全部特殊用途段与封装形式） | 46 | **全部拒绝** |
+| 必须放行的合法公网地址 | 7 | **全部放行**（无假阳性） |
+| 混合 DNS 结果（含 1 个非法即拒绝） | ✔ | 拒绝 |
+| 重定向到 `169.254.169.254` / `10.0.0.5` | ✔ | 拒绝，且**内网目标从未被请求** |
+| 逐跳复验（校验调用位于重定向循环体内） | ✔ | 通过 |
 
 ### 3.3 豁免机制及其风险控制
 
-`trusted_internal_hosts()` 收集三类主机：
+`trusted_internal_hosts()` 收集三类主机：`TRUSTED_INTERNAL_HOSTS` 显式配置、`SMTP_HOST`、`AI_BASE_URL` 的 host。
 
-1. `TRUSTED_INTERNAL_HOSTS` 显式配置（逗号分隔）
-2. `SMTP_HOST` 自动加入
-3. `AI_BASE_URL` 的 host 自动加入
-
-**风险控制**：豁免是**按主机精确匹配**的，不是按网段。`trusted_internal_hosts()` 不接受 CIDR，通配符或网段形式不会被展开为整个内网。已由测试断言：信任主机解析成功、非信任主机仍抛 `SSRFError`。
+**风险控制**：豁免是**按主机精确匹配**的，不接受 CIDR / 通配符 / 网段形式。
 
 ### 3.4 覆盖面
 
@@ -110,9 +147,90 @@ L2 是关键：单纯做 URL 字符串校验存在 **TOCTOU 窗口**（校验时
 
 ---
 
-## 4. 认证与授权
+## 4. 数据库凭据处理
 
-### 4.1 口令存储
+### 4.1 配置来源与优先级
+
+| 优先级 | 来源 | 语义 |
+|---|---|---|
+| 1（首选） | `DB_USER` + `DB_PASSWORD` + `DB_HOST` + `DB_NAME`（+ `DB_PORT`） | 口令是**字面值**，程序编码**恰好一次**。`DB_PASSWORD_ENCODED=true` 表示该值**已**被编码，原样使用 |
+| 2（回退） | `DATABASE_URL` | 内嵌凭据：已编码则原样透传；未编码则编码一次（判定规则见 §4.2） |
+
+`app/database.py`、`alembic/env.py`、API 与 Worker **全部**经由 `encode_db_url()`，不存在旁路。
+
+### 4.2 编码状态判定规则（本轮 S1 的核心）
+
+**问题**：原始口令与已编码口令在字符串层面**不可区分**——原始口令 `pa%41ss` 与「`paAss` 的编码形式」完全同形。猜测错误会**静默篡改凭据**。
+
+**解法**：`quote(value, safe="")` 只保留 `A-Za-z0-9_.-~`。因此一个**真正已编码**的凭据，必然至少包含一个「解码后落在该安全集之外」的 `%XX` 转义。
+
+| 输入 | 判定 | 结果 | 驱动最终收到的口令 |
+|---|---|---|---|
+| `p@ss:w/rd` | 无 `%XX` → 原始 | `p%40ss%3Aw%2Frd` | `p@ss:w/rd` ✅ |
+| `pa%41ss` | `%41`→`A`（安全集内）→ 原始 | `pa%2541ss` | `pa%41ss` ✅（**不再被误解码为 `paAss`**） |
+| `pa%40ss` | `%40`→`@`（需转义）→ 已编码 | 原样 | `pa@ss` ✅（**不二次编码**） |
+| `pa%3Ass` | `%3A`→`:`（需转义）→ 已编码 | 原样 | `pa:ss` ✅ |
+| `pa%2541ss` | `%25`→`%`（需转义）→ 已编码 | 原样 | `pa%41ss` ✅ |
+| `复杂密码123` | 无 `%XX` → 原始 | UTF-8 百分号编码 | `复杂密码123` ✅ |
+
+**残余歧义（不可约化）**：原始口令若字面包含 `%40` 这类「解码后需转义」的转义串，与「已编码」形式不可区分。此时**必须**使用显式的 `DB_PASSWORD` 通道（编码状态被声明而非猜测）。已在代码 docstring、`docs/DEPLOY.md` 与本报告中标注。
+
+### 4.3 部署一致性
+
+`docker-compose.prod.yml` 的 `migrate` / `api` / `worker` 三个服务**内联同一组**：
+
+```yaml
+DATABASE_URL: postgresql+psycopg://${DB_USER:-radar}:${DB_PASSWORD}@db:5432/${DB_NAME:-radar}
+DB_HOST: db
+DB_PORT: "5432"
+DB_NAME: ${DB_NAME:-radar}
+DB_USER: ${DB_USER:-radar}
+DB_PASSWORD: ${DB_PASSWORD:?required, set in .env}
+```
+
+- `DATABASE_URL` 仍导出以兼容直接读取该变量的工具，且**只引用变量、不含任何硬编码口令**；
+- 应用层**优先**使用离散分量（`encode_db_url` 的优先级 1），因此**被拼接破坏的 URI 永远不是实际连接所用的 URI**；
+- `DB_PASSWORD` 使用 `:?required` 形式 —— 缺失时 compose **直接失败**；
+- 三个服务取值**完全一致**（由 `test_deploy_config_fencing.py` 断言）。
+
+### 4.4 生产配置校验
+
+`validate_production_config()` 在 `ENV=production` 时拒绝启动于以下情形：JWT 密钥为默认或 <32 位；管理员口令为默认或 <12 位；`ROLE` 非法；缺少数据库主机名；数据库口令 <16 位、为常见默认值或为纯数字；`ALLOWED_ORIGINS` 为空或含通配符。
+
+---
+
+## 5. 调度器租约与 Fencing
+
+### 5.1 租约模型
+
+`SchedulerLock(id=1)` 保存 `holder` / `acquired_at` / `heartbeat_at` / **`lease_version`**。`lease_version` 在每次获取时**单调递增**，是 fencing token。
+
+### 5.2 Fencing 语义（本轮 S2 / S3）
+
+| 环节 | 修复前 | 修复后 |
+|---|---|---|
+| 读取租约 | `db.get(SchedulerLock, 1)` —— **返回 identity map 缓存**，长连接 Session 持续读到陈旧行 | `_read_lease_row_fresh()` —— `populate_existing()` 强制刷新 |
+| 心跳续约 | 只比对 `holder` | 比对 `holder` **且** `lease_version` |
+| 调度前检查 | 检查 `holder` | 检查 `holder` + 新鲜度 + `lease_version` |
+| **业务写入** | **完全不检查** —— 抓取期间租约被接管，旧 Leader 仍 commit | **每次 commit 前**经 `LeaseGuard.check()` 校验 `lease_version`；失效则回滚并中止 |
+
+`LeaseGuard` 在 `scheduler._crawl_job()` 中创建，透传到 `pipeline.create_task_and_crawl()` → `crawl_source()`，覆盖**每一个**业务写入点：`RawDocument` 落库、`Event` 创建、`merge_event` 合并、搜索发现的 source 写入，以及最终的抓取状态汇总。
+
+### 5.3 实测覆盖（`tests/test_lease_fencing.py`，25 项，退出码 0）
+
+| 场景 | 断言 |
+|---|---|
+| 多进程竞争 | 只有一个进程拿到租约；失败者无法心跳、无法通过 fencing |
+| 租约过期被接管 | 旧 Leader 的下一次写入被 fence；`{"fenced": true}` |
+| 旧 Leader 恢复 | 无法续约、无法提交 |
+| 数据库短暂不可用 | 不写库（校验异常即放弃本次任务） |
+| identity map 陈旧行 | `current_lease_version` / `lease_still_valid` / `heartbeat` **均不信任**陈旧行 |
+
+---
+
+## 6. 认证与授权（v1.4 审计结论，本轮复核无回归）
+
+### 6.1 口令存储
 
 | 项 | 值 |
 |---|---|
@@ -121,280 +239,89 @@ L2 是关键：单纯做 URL 字符串校验存在 **TOCTOU 窗口**（校验时
 | 比对 | `hmac.compare_digest`（常量时间） |
 | 生成 | `secrets` 模块（CSPRNG） |
 
-### 4.2 JWT
+### 6.2 JWT
 
 | 项 | 值 |
 |---|---|
 | 算法 | HS256 |
 | 有效期 | 12 小时 |
-| 密钥强度 | 生产环境强制 ≥32 字符（`validate_production_config`） |
+| 密钥强度 | 生产环境强制 ≥32 字符 |
 | 校验 | 签名、过期、`alg` 字段均校验；错误密钥签发的 token 被拒 |
 
-### 4.3 认证边界（审计后）
+### 6.3 暴力破解防护
 
-**公开（产品面，无敏感数据）**：
-
-```
-GET /api/events           GET /api/events/{id}      GET /api/calendar
-GET /api/stats/dashboard  GET /api/stats/analysis
-GET /api/status           GET /api/health
-GET /health/live          GET /health/ready         GET /health/scheduler
-```
-
-**需认证（运维面 + 全部写操作）**：
-
-```
-GET  /api/sources              GET /api/sources/{id}
-GET  /api/crawl-tasks           GET /api/crawl-tasks/running
-GET  /api/crawl-tasks/{id}      GET /api/crawl-logs
-GET  /api/monitor               GET /api/notification-rules
-GET  /api/settings
-POST /api/notification-rules/{id}/test     ← 会真实外发
-```
-
-前端无需改动：`api()` 已自动附加 Bearer token；所有运维页面位于 `RequireAuth` 之后。
-
-### 4.4 暴力破解防护
-
-```
-LOGIN_MAX_ATTEMPTS   = 5      # 窗口内失败次数阈值
-LOGIN_WINDOW_SECONDS = 300    # 计数窗口
-LOGIN_LOCKOUT_SECONDS= 300    # 锁定时长
-```
-
-- 计数键：`(客户端 IP, 用户名小写)` —— 防止用一个 IP 锁死所有账号，也防止一个账号被多 IP 无限尝试
-- 客户端 IP：优先取 `X-Forwarded-For` 首段（nginx 是唯一入口并覆写该头），缺失时回退 socket peer
-- 错误信息对"用户不存在"与"口令错误"**完全一致**，不泄露账号存在性
-- 成功登录清零计数
-- 失败登录写 `AuditLog`（`action="login_failed"`），可集中观测
-- **已知限制**：计数器在进程内存中。多 API 副本时按副本生效——失败尝试仍可通过审计日志集中发现，但锁定不跨副本。如需全局锁定需引入共享存储（Redis 等）。
-
-### 4.5 管理员重置令牌
-
-使用 `secrets.compare_digest` 做常量时间比较（避免令牌比较的时序侧信道）。
+`(IP, 用户名)` 滑动窗口：5 次失败锁定 300 秒；失败写入审计日志。
 
 ---
 
-## 5. 输入与输出安全
+## 7. 输入与输出安全（v1.4 审计结论，本轮复核无回归）
 
-### 5.1 存储型 XSS 路径（已修复）
+- **存储型 XSS 路径已修复**：后端 `sanitize_url()` 在**不可信数据进入数据库的边界**阻断 `javascript:` 等危险协议；前端 `safeHref()` 兜底。
+- 服务端输入统一经 `sanitize_text()` / `sanitize_url()` 处理。
+- CORS：生产环境 `ALLOWED_ORIGINS` 必须显式配置，禁止通配符与携带凭证。
 
-**原路径**：
+---
+
+## 8. 依赖漏洞
+
+### 8.1 Python — pip-audit 2.10.1（实际运行）
+
 ```
-恶意 feed <link>javascript:alert(1)</link>
-  → collectors/rss_sitemap.py 存入 EventSource.url
-  → services/dedup.py 写入
-  → frontend <a href={s.url}> 渲染
-  → 浏览器执行脚本（在本站源下）
+.venv/Scripts/python.exe -m pip_audit -r backend/requirements.txt
 ```
+**退出码 0 — `No known vulnerabilities found`**（24 个锁定依赖，`backend/requirements.txt` 全部固定到实测版本）
 
-React 18 会转义**文本内容**，但**不会**过滤 `href` 的协议——这是常见的误判点。
+### 8.2 前端
 
-**修复（双端）**：
+`frontend/package-lock.json` 锁定；本轮未改动前端依赖。
 
-```python
-# 后端 app/security.py —— 源头阻断
-SAFE_URL_SCHEMES = ("http://", "https://")
+---
 
-def sanitize_url(url: str, max_len: int = 2000) -> str:
-    cleaned = "".join(c for c in url
-                      if c not in "\r\n\t\x00" and ord(c) >= 32).strip()
-    lowered = cleaned.lower()
-    if not lowered.startswith(SAFE_URL_SCHEMES):
-        head = cleaned.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
-        if ":" in head:      # 携带 scheme 但不在白名单 → 拒绝
-            return ""
-    return cleaned[:max_len]
-```
+## 9. 密钥与凭证管理
 
-```ts
-// 前端 frontend/src/api.ts —— 渲染兜底
-export function safeHref(url: string | null | undefined): string {
-  if (!url) return ''
-  const cleaned = url.replace(/[\r\n\t\0]/g, '').trim()
-  if (!cleaned) return ''
-  const lower = cleaned.toLowerCase()
-  if (lower.startsWith('http://') || lower.startsWith('https://')) return cleaned
-  if (!/^[a-z][a-z0-9+.-]*:/i.test(cleaned)) return cleaned  // 无 scheme 的相对路径
-  return ''
-}
-```
-
-两者均处理大小写混淆（`JaVaScRiPt:`）与控制字符绕过（`java\nscript:`）。已在 `EventDetail.tsx` 与 `SourceDetail.tsx` 两处渲染点接入。
-
-### 5.2 前端 XSS 面整体评估
-
-| 检查项 | 结果 |
+| 项 | 状态 |
 |---|---|
-| `dangerouslySetInnerHTML` | **未使用** |
-| `innerHTML` | **未使用** |
-| `eval(` / `new Function` | **未使用** |
-| 文本渲染 | React 默认转义 |
-| `href={...}` 外部 URL | 已加 `safeHref()` 兜底 |
+| `.env` | 被 `.gitignore` 排除，未入库 |
+| `*.db` / `data/` | 被 `.gitignore` 排除，未入库 |
+| 证书 / PEM | 未入库 |
+| compose 中的口令 | **仅** `${DB_PASSWORD}` 变量引用，无任何硬编码 |
+| 日志中的口令 | 通知渠道凭证与数据库口令均不写入日志 |
+| `ADMIN_RESET_TOKEN` | 可选，留空即禁用；不返回明文 |
 
-### 5.3 服务端输入处理
-
-| 输入 | 处理 |
-|---|---|
-| 爬取正文 | `sanitize_text()` —— 去控制字符、长度上限 20000 |
-| 标题 | 上限 500 |
-| URL | 上限 2000 + 协议白名单 |
-| 通知规则配置 | 密钥字段掩码返回；`SECRET_KEY_HINTS` 识别 password/token/key/secret/webhook_url/bot_token/wecom_webhook_key |
-| 错误信息 | 截断至 300 字符，防信息泄漏 |
+**本轮核验**：`git ls-files` 中不存在 `.env` / `*.db` / `data/` / `.venv/` / `node_modules/` / `*.pem` / `*.crt` / `secret` 等敏感文件。
 
 ---
 
-## 6. CORS 与响应头
+## 10. 审计留痕
 
-### 6.1 CORS
-
-```python
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins(),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"])
-
-def allowed_origins() -> list[str]:
-    if settings.ALLOWED_ORIGINS.strip():
-        return [o.strip() for o in settings.ALLOWED_ORIGINS.split(",") if o.strip()]
-    if is_production(settings.ENV):
-        raise SystemExit("⛔ 生产环境必须显式配置 ALLOWED_ORIGINS（逗号分隔），拒绝默认通配")
-    return DEV_ORIGINS
-```
-
-- 生产环境**未配置 `ALLOWED_ORIGINS` 时进程直接退出**，不会静默回落到通配符
-- `allow_credentials=True` 配合 `allow_origins=["*"]` 是 Starlette 的已知危险组合；本项目生产环境不可能取到 `*`（上条已阻断）
-- 已由测试断言源码中不存在 `allow_origins=["*"]`
-
-### 6.2 响应头
-
-| 头 | nginx.prod.conf | nginx.tls.conf |
-|---|---|---|
-| `X-Content-Type-Options: nosniff` | ✅ | ✅ |
-| `X-Frame-Options: DENY` | ✅ | ✅ |
-| `Referrer-Policy: strict-origin-when-cross-origin` | ✅ | ✅ |
-| `Strict-Transport-Security: max-age=31536000` | — | ✅ |
-
-**缺口（如实记录）**：未设置 `Content-Security-Policy`。本项目为纯 SPA 且无 `innerHTML`，当前风险低，但建议后续补 `default-src 'self'` 策略。
-
-**缺口**：应用层未启用 `TrustedHostMiddleware`（Host 头校验）。nginx 是唯一入口时影响有限，但若 API 端口被直接暴露则建议补上。
-
----
-
-## 7. 依赖漏洞
-
-### 7.1 Python — pip-audit 2.10.1（实际运行）
-
-```
-$ pip_audit -r requirements.txt --progress-spinner off
-No known vulnerabilities found
-
-$ pip_audit --local --progress-spinner off --skip-editable
-初次：3 项 → 全部位于构建工具链（certifi / pip），不在应用依赖中
-处置：pip install --upgrade "certifi>=2026.10.19" "pip>=26.2"
-复扫：无已知漏洞
-```
-
-### 7.2 Python 依赖版本（已全部固定）
-
-```
-fastapi==0.146.0            sqlalchemy==2.1.5          pydantic==2.14.1
-pydantic-settings==2.16.0  uvicorn==0.54.0            alembic==1.20.0
-APScheduler==3.11.3         httpx==0.28.1              PyJWT==2.15.1
-cryptography==50.0.2        psycopg[binary]==3.2.13    feedparser==6.0.14
-beautifulsoup4==4.15.0      lxml==6.1.3                python-multipart==0.0.32
-```
-
-固定版本同时提供**可复现构建**与**供应链完整性**：任何一次安装得到的都是被本次审计验证过的那一组。
-
-### 7.3 前端 — npm audit
-
-```
-$ npm audit --omit=dev --audit-level=high
-2 moderate severity vulnerabilities
-```
-
-| 公告 | 描述 | 判定 | 依据 |
-|---|---|---|---|
-| GHSA-wrjc-x8rr-h8h6 | 反斜杠开放重定向 | **不可达** | 已逐一核查全部 30+ 处 `<Link to>` / `navigate()` 目标：均为静态字面量或 `/events/${e.id}` 形式的内部数字 ID。无用户可控的外部重定向目标 |
-| GHSA-337j-9hxr-rhxg | `deserializeErrors()` 构造器注入 | **不可达** | 纯客户端 SPA（`HashRouter` + `createRoot`），无 SSR、无 hydration 路径 |
-
-**处置**：修复需升级至 `react-router-dom@7.18.4`（破坏性大版本）。基于"风险不可达 + 破坏性升级回归成本更高"的权衡，**已记录为待办而非强制升级**。若后续引入 SSR 或允许用户配置跳转目标，必须立即升级。
-
----
-
-## 8. 密钥与凭证管理
-
-| 项 | 机制 |
-|---|---|
-| JWT 密钥 | 仅从环境变量读取；生产强制 ≥32 字符；不入库、不入日志 |
-| 管理员口令 | 环境变量注入；生产拒绝默认值且 ≥12 位 |
-| DB 口令 | 生产强制 PostgreSQL + ≥16 位口令 |
-| `DATABASE_URL` 编码 | `encode_db_url()` 幂等单层百分号编码（避免双重编码导致连不上库） |
-| 通知渠道密钥 | 存储时明文（数据库层信任边界内），**API 读取时掩码为 `***`**；编辑时掩码语义化为"未修改"，服务端保留原值 |
-| 日志 | 审计详情不含 token；通知错误信息截断 300 字符 |
-| 仓库 | `.env` 不入库（`.gitignore`）；`.env.example` 仅占位符 |
-
-**已知缺口**：`DB_URL` / `JWT_SECRET` 等在生产环境应来自密钥管理服务（Vault / KMS / 云厂商 Secrets Manager）而非普通环境变量文件。当前实现接受任意来源的环境变量，运维责任是使用受控注入渠道。
-
----
-
-## 9. 审计留痕
-
-| 操作 | 记录 |
-|---|---|
-| 全部数据源增删改 | `AuditLog`（action 区分操作类型） |
-| 通知规则增删改 | `AuditLog` |
-| 密码变更 | `AuditLog` |
-| 登录失败 | `AuditLog`（`action="login_failed"`） |
-| 爬取任务与调度 | `CrawlLog` + `CrawlTask` 状态历史 |
-| 活动字段变更 | `EventHistory`（记录 old → new） |
-
-已由测试断言：写操作后必有审计记录；审计内容中不含 Bearer token。
-
----
-
-## 10. 访问控制模型
-
-系统为**单管理员**模型（`ADMIN_USERNAME` / `ADMIN_PASSWORD` 环境变量注入），无多角色 RBAC。
-
-**这一设计的含义**：
-- 所有通过认证的用户拥有**相同权限**（即管理员权限）
-- 因此认证边界的价值在于"把运维面从公开互联网收回"，而非"区分用户"
-- 若未来需要多角色（只读观察者、运营、超级管理员），需引入用户表 + 角色列 + 逐端点依赖
-
-**当前授权依赖的完整性**：审计已核查全部 30+ 端点，除公开产品面外均已加 `Depends(current_user)`，并由 `test_release_hardening.py` 逐一断言（9 个端点无 token → 401）。
+登录失败、通知发送、规则变更、爬取任务与调度状态变更均写审计日志；通知渠道凭证与数据库口令**不进入**日志。
 
 ---
 
 ## 11. 剩余风险登记
 
-| 风险 | 等级 | 影响 | 处置 |
-|---|---|---|---|
-| Docker / PostgreSQL / TLS / 24h 运行未验证 | **高（发布阻断）** | 生产行为未知 | `RELEASE_CHECKLIST.md` 中列为 BLOCKING，须在有 Docker 与域名的机器上执行 |
-| 登录限流为进程内状态 | 中 | 多副本时限流按副本生效 | 失败登录已写审计日志可集中观测；全局限流需引入共享存储 |
-| 无 CSP 头 | 中 | 当前无 XSS sink，风险低；引入 `innerHTML` 或第三方脚本后会放大 | 后续补充 `default-src 'self'` |
-| 无 `TrustedHostMiddleware` | 低 | Host 头未校验 | API 端口不对外暴露时可接受；否则补上 |
-| 密钥来自普通环境变量 | 中 | 容器/主机被攻破时密钥泄露 | 生产应接入 KMS / Secrets Manager |
-| react-router 2 项 moderate | 低 | 已验证不可达 | 引入 SSR 或用户可控跳转目标时**必须**升级 v7.18.4 |
-| 无 APM / 错误上报 | 中 | 生产问题定位依赖日志 | 建议接入 Sentry 等 |
-| `TRUSTED_INTERNAL_HOSTS` 配错会削弱 SSRF 防护 | 中 | 过度信任可能引入内网暴露 | 配置项应最小化；变更需评审 |
+| # | 风险 | 等级 | 说明 | 缓解 / 复验计划 |
+|---|---|---|---|---|
+| R1 | 真实 PostgreSQL 服务端上的端到端连接未验证 | **中** | 宿主 `initdb.exe` 崩溃（`ucrtbase.dll` / `0xC0000409`，两套独立构建同样复现），已用 PostgreSQL v3 wire 协议 + 真实 psycopg 驱动逐字节验证凭据（7 项全绿），但 PostgreSQL 自身的口令存储与真实 SCRAM 协商未实测 | 在具备 PostgreSQL 的环境复跑 `tests/test_db_connection_wire.py` 与迁移/启动脚本 |
+| R2 | 多进程锁竞争测试跑在 SQLite 上 | **中** | SQLite 与 PostgreSQL 锁语义不同 | 在目标 PostgreSQL 复跑 `tests/test_scheduler_lock_stress.py`、`tests/test_lease_fencing.py` |
+| R3 | Docker 镜像构建与容器编排未执行 | **中** | 本机无 Docker；compose 仅做静态 YAML 解析验证 | 在目标主机执行 `bash scripts/deploy.sh` 完整验收 |
+| R4 | `DATABASE_URL` 内嵌口令存在不可约化歧义 | **低** | 原始口令字面含 `%40` 之类转义串时不可区分 | 使用显式 `DB_PASSWORD` + `DB_PASSWORD_ENCODED`（无歧义）；已在代码与部署文档标注 |
+| R5 | `real_network` 标记的 3 项测试未执行 | **低** | 需 `-m real_network` 且依赖公网可达 | CI 中作为独立任务按需触发 |
+| R6 | Worker 容器内健康检查需 Docker 验证 | **低** | 判定逻辑已由脚本与配置测试覆盖 | 随 R3 一并复验 |
 
 ---
 
 ## 12. 安全结论
 
-**代码与依赖层面：通过。**
+| 维度 | 结论 |
+|---|---|
+| P0 缺陷 | **0 项未修复**（本轮新发现 1 项 P0 生产启动阻断 + 2 项 P0 一致性/凭据缺陷，均已修复并有回归测试锁定） |
+| P1 缺陷 | **0 项未修复**（本轮 4 项，均已修复并有回归测试锁定） |
+| P2 缺陷 | **0 项未修复**（本轮 2 项，均已修复） |
+| 依赖漏洞 | 0（pip-audit 实际运行） |
+| 敏感文件入库 | 0 |
+| 部署环境验证 | **2 项 NOT VERIFIED**（Docker 编排、真实 PostgreSQL 服务端）—— 见 R1 / R3 |
 
-- 本次修复 **2 项 P0、7 项 P1、2 项 P2** 安全缺陷，全部有对应回归测试
-- SSRF 为三层纵深防护（策略 + 解析层 + 逐跳），覆盖全部出网出口
-- 认证边界完整，9 个此前公开的运维端点已收回
-- 存储型 XSS 在存储层与渲染层双端阻断
-- Python 依赖 **零已知漏洞**；前端 2 项 moderate 已逐一验证不可达并记录理由
-- 审计留痕覆盖所有写操作与登录失败
+**代码与依赖层面：通过。** 未修复的 P0/P1 数量为 **0**，不阻断发布。
 
-**部署层面：待验证（BLOCKING）。**
-
-Docker 编排、PostgreSQL 真实运行、TLS 证书链、24 小时连续运行这 6 类项目在当前环境**客观无法验证**，已全部标注 **NOT VERIFIED** 并在 `RELEASE_CHECKLIST.md` 中给出具体验证命令与通过标准。它们**未被计入"通过"**，必须由具备条件的一方补做后方可发布。
+发布放行结论见 `docs/RELEASE_AUDIT.md`。

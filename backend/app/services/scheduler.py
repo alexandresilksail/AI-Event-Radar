@@ -63,9 +63,16 @@ def _crawl_job(source_id: int) -> None:
                 logger.warning("调度前租约校验失败（数据库异常），取消本次任务 source=%s: %s",
                                source_id, e)
                 return
+            # Fencing token: the lease_version we hold right now. Every business
+            # write below is guarded by it, so if the lease is taken over while
+            # the crawl is in flight, nothing this job produced is committed.
+            guard = LeaseGuard(db)
+            if not guard.active:
+                logger.warning("未能取得 fencing token，取消本次调度任务 source=%s", source_id)
+                return
             source = db.get(Source, source_id)
             if source and source.enabled:
-                create_task_and_crawl(db, source, trigger="scheduled")
+                create_task_and_crawl(db, source, trigger="scheduled", lease_guard=guard)
         finally:
             db.close()
     except Exception as e:
@@ -141,10 +148,24 @@ def try_acquire_lock(db) -> bool:
 
 
 def heartbeat(db) -> bool:
-    """Renew the lease. Returns False when the lease was lost/taken over."""
+    """Renew the lease. Returns False when the lease was lost/taken over.
+
+    The renewal is conditional on BOTH the holder name and the lease version
+    this process acquired. Without the version check, a process that was
+    demoted and later re-elected (or restarted with the same HOLDER_ID) could
+    keep renewing a lease that now belongs to someone else.
+
+    The version is read with a fresh query (bypassing the identity map) so a
+    stale in-session row can never make this succeed.
+    """
+    row = _read_lease_row_fresh(db)
+    if not row or row.holder != HOLDER_ID:
+        return False
     result = db.execute(
         update(SchedulerLock)
-        .where(SchedulerLock.id == 1, SchedulerLock.holder == HOLDER_ID)
+        .where(SchedulerLock.id == 1,
+               SchedulerLock.holder == HOLDER_ID,
+               SchedulerLock.lease_version == row.lease_version)
         .values(heartbeat_at=utcnow())
     )
     db.commit()
@@ -152,17 +173,134 @@ def heartbeat(db) -> bool:
 
 
 def is_leader(db) -> bool:
-    row = db.get(SchedulerLock, 1)
+    row = _read_lease_row_fresh(db)
     return bool(row and row.holder == HOLDER_ID)
 
 
 def _lease_still_held(db) -> bool:
-    row = db.get(SchedulerLock, 1)
+    row = _read_lease_row_fresh(db)
     if not row or row.holder != HOLDER_ID:
         return False
     stale = utcnow() - (row.heartbeat_at or utcnow()) > \
         timedelta(seconds=settings.SCHEDULER_LOCK_TTL)
     return not stale
+
+
+def _read_lease_row_fresh(db):
+    """Read the lease row DIRECTLY from the database, bypassing the identity map.
+
+    Why this exists
+    ---------------
+    `db.get(SchedulerLock, 1)` returns the object cached in the session's
+    identity map. SQLAlchemy does NOT re-query the database when the object
+    is already present, so a long-lived session keeps serving a STALE lease
+    row. That defeats the entire fencing mechanism: a leader that was taken
+    over would still see itself as the holder and keep writing.
+
+    `populate_existing()` forces the query to overwrite the already-loaded
+    instance with the values currently in the database, so the check always
+    reflects what is actually committed.
+    """
+    row = db.query(SchedulerLock).populate_existing().filter(
+        SchedulerLock.id == 1).first()
+    return row
+
+
+def current_lease_version(db) -> int | None:
+    """The fencing token of the lease THIS process currently holds.
+
+    Returns the `lease_version` if we are the holder and the lease is fresh,
+    else None. The version increases on every acquisition, so a caller that
+    remembers the token it started with can detect a takeover: if the stored
+    version has moved on, this process is no longer the leader and must not
+    commit any further side effects.
+    """
+    row = _read_lease_row_fresh(db)
+    if not row or row.holder != HOLDER_ID:
+        return None
+    stale = utcnow() - (row.heartbeat_at or utcnow()) > \
+        timedelta(seconds=settings.SCHEDULER_LOCK_TTL)
+    if stale:
+        return None
+    return row.lease_version
+
+
+def lease_still_valid(db, expected_version: int | None) -> bool:
+    """True only if we still hold the very same lease version we started with.
+
+    This is the fencing check for the *write* path. Checking only the holder
+    name is not enough: a process can be re-elected later (same HOLDER_ID after
+    a restart, or a same-host restart reusing the id), and between the start
+    of a long crawl and its commit the lease may have been taken over and
+    re-acquired. The monotonically increasing `lease_version` closes that gap.
+    """
+    if expected_version is None:
+        return False
+    current = current_lease_version(db)
+    return current is not None and current == expected_version
+
+
+class LeaseLostError(RuntimeError):
+    """Raised when the leadership lease was lost while a job was running.
+
+    The job must abort WITHOUT committing its business writes.
+    """
+
+
+class LeaseGuard:
+    """Guards the business write path against a lost leadership lease.
+
+    Usage inside a crawl:
+
+        guard = LeaseGuard(db)
+        token = guard.token()          # None if we are not the leader
+        ...
+        guard.check(db)                # raises LeaseLostError if fenced out
+        db.commit()                    # only reached while still leader
+
+    The check runs immediately BEFORE each commit that would persist crawl
+    results, so a demoted leader can never write events, raw documents or
+    notification side effects.
+    """
+
+    def __init__(self, db):
+        self._db = db
+        self._version = current_lease_version(db)
+        self._active = self._version is not None
+
+    @property
+    def active(self) -> bool:
+        """True when this process holds a lease and the guard is enforcing."""
+        return self._active
+
+    @property
+    def version(self) -> int | None:
+        return self._version
+
+    def token(self) -> int | None:
+        return self._version
+
+    def check(self, db=None) -> None:
+        """Raise LeaseLostError if the lease was lost/taken over.
+
+        Also invalidates the guard permanently: once fenced out, a process must
+        not write anything else, even if it later re-acquires leadership.
+        """
+        if not self._active:
+            raise LeaseLostError("调度器未持有租约，拒绝写入")
+        target = db if db is not None else self._db
+        try:
+            still = lease_still_valid(target, self._version)
+        except Exception as e:
+            # Cannot verify (DB trouble) -> treat as lost. Failing closed is
+            # the only safe choice: the alternative is writing results from a
+            # leader that may have been demoted.
+            self._active = False
+            raise LeaseLostError(f"租约校验失败（数据库异常）：{e}") from e
+        if not still:
+            self._active = False
+            raise LeaseLostError(
+                f"领导租约已失效或被接管（fencing token={self._version}），拒绝写入")
 
 
 def release_lock(db) -> bool:
@@ -273,7 +411,7 @@ def lease_status() -> dict:
     """
     db = SessionLocal()
     try:
-        lock = db.get(SchedulerLock, 1)
+        lock = _read_lease_row_fresh(db)
         if lock is None or not lock.holder:
             return {"leader_elected": False, "leader_holder": None,
                     "lease_valid": False, "heartbeat_age_seconds": None,
@@ -297,7 +435,7 @@ def scheduler_status() -> dict:
     """Explicit, non-fake status breakdown."""
     db = SessionLocal()
     try:
-        lock = db.get(SchedulerLock, 1)
+        lock = _read_lease_row_fresh(db)
         leader = bool(lock and lock.holder)
         leadership = lock.holder if lock else None
         lease_version = lock.lease_version if lock else None

@@ -18,17 +18,12 @@ DEFAULT_JWT_SECRET = "change-me-in-production"
 DEFAULT_ADMIN_PASSWORD = "admin123"
 DEFAULT_PG_PASSWORDS = {"密码", "password", "change-me", "radar", "postgres"}
 
-_HEX_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
-
-
-def _looks_encoded(value: str) -> bool:
-    """Heuristic: credential already carries percent-escapes -> treat as encoded.
-
-    Documented ambiguity: a raw password that literally contains '%' + two hex
-    digits is mistaken for encoded input. Prefer relying on the docker-compose
-    default, which passes raw values and lets encode_db_url encode exactly once.
-    """
-    return bool(_HEX_ESCAPE.search(value))
+# The characters `urllib.parse.quote(value, safe="")` never escapes.
+# Anything else MUST be percent-encoded inside a URL userinfo component.
+_ALWAYS_SAFE = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ" "abcdefghijklmnopqrstuvwxyz" "0123456789" "_.-~"
+)
+_PCT_ESCAPE = re.compile(r"%([0-9A-Fa-f]{2})")
 
 
 def _split_db_credentials(url: str) -> tuple[str | None, str | None, str]:
@@ -50,11 +45,55 @@ def _split_db_credentials(url: str) -> tuple[str | None, str | None, str]:
     return user, pwd, hostpart
 
 
+def _credential_is_encoded(value: str) -> bool:
+    """Decide whether a credential already carries percent-escapes.
+
+    The rule
+    --------
+    `quote(value, safe="")` escapes everything except ``A-Za-z0-9_.-~``.
+    So a *correctly encoded* credential necessarily contains at least one
+    ``%XX`` escape whose decoded character is outside that always-safe set
+    (``%40`` -> '@', ``%3A`` -> ':', ``%25`` -> '%', ...).
+
+    A raw password that merely *looks* encoded (``pa%41ss``, where ``%41``
+    decodes to the always-safe 'A') carries no such escape and is therefore
+    correctly treated as raw.
+
+    This is what separates the two cases a naive "%XX present?" test cannot:
+    ``pa%41ss`` (raw) must become ``pa%2541ss`` while ``pa%40ss`` (already
+    encoded, i.e. ``pa@ss``) must be left untouched.
+
+    Residual ambiguity
+    ------------------
+    A raw password that literally contains ``%40``-style text whose decoded
+    character needs escaping (``pa%40ss``) is indistinguishable from the
+    encoded form. No string inspection can resolve it. Operators with such a
+    password must use the explicit ``DB_PASSWORD`` setting, where the encoding
+    state is stated instead of guessed.
+    """
+    if not value:
+        return False
+    for m in _PCT_ESCAPE.finditer(value):
+        if chr(int(m.group(1), 16)) not in _ALWAYS_SAFE:
+            return True
+    return False
+
+
+def _encode_credential(value: str, already_encoded: bool = False) -> str:
+    """Percent-encode a credential exactly once."""
+    if already_encoded:
+        return value
+    return quote(value, safe="")
+
+
 def _decode_credential(raw: str | None) -> str:
-    """Best-effort decode of a credential that may be raw or encoded."""
+    """Recover the literal value of a credential for *validation* only.
+
+    Never used to build a connection string — see `encode_db_url`.
+    """
     if not raw:
         return ""
-    return unquote(raw) if _looks_encoded(raw) else raw
+    return unquote(raw) if _credential_is_encoded(raw) else raw
 
 
 class Settings(BaseSettings):
@@ -68,6 +107,21 @@ class Settings(BaseSettings):
 
     # Database: SQLite for dev, PostgreSQL via DATABASE_URL for production
     DATABASE_URL: str = "sqlite:///./data/radar.db"
+
+    # Explicit PostgreSQL connection parts. When DB_USER + DB_HOST + DB_NAME
+    # are all set, encode_db_url() builds the URL from these instead of
+    # DATABASE_URL, and DB_PASSWORD is treated as the LITERAL password and
+    # percent-encoded exactly once. This is the unambiguous path: no guessing
+    # about whether a '%' in the password is an escape or a literal.
+    #
+    # DB_PASSWORD_ENCODED=true means "DB_PASSWORD is already percent-encoded"
+    # — only for operators who deliberately store an encoded value.
+    DB_HOST: str = ""
+    DB_PORT: int = 5432
+    DB_NAME: str = ""
+    DB_USER: str = ""
+    DB_PASSWORD: str = ""
+    DB_PASSWORD_ENCODED: bool = False
 
     # Auto-run alembic migrations at process start. Dev default: True.
     # Production: keep False — the dedicated one-shot `migrate` service owns it,
@@ -143,6 +197,23 @@ def auto_migrate_enabled(s: "Settings") -> bool:
     return bool(s.AUTO_MIGRATE)
 
 
+def effective_db_password(s: "Settings") -> str:
+    """The literal database password, whatever the configuration source.
+
+    Used for strength validation. When the password comes from DB_PASSWORD it
+    is returned verbatim (that is the literal value). When it is embedded in
+    DATABASE_URL it is already encoded, so it is decoded once for the length
+    / default-value checks.
+    """
+    if s.DB_PASSWORD:
+        return unquote(s.DB_PASSWORD) if s.DB_PASSWORD_ENCODED else s.DB_PASSWORD
+    url = s.DATABASE_URL
+    if url.startswith(("postgres://", "postgresql://", "postgresql+psycopg://")):
+        _, pwd_raw, _ = _split_db_credentials(url)
+        return _decode_credential(pwd_raw)
+    return ""
+
+
 def validate_production_config(s: "Settings") -> None:
     """Refuse to boot production with unsafe defaults. Raises SystemExit with clear message."""
     if not is_production(s.ENV):
@@ -156,23 +227,34 @@ def validate_production_config(s: "Settings") -> None:
         problems.append("ADMIN_PASSWORD 为默认值或长度不足 12 位，生产环境必须使用强密码")
     if s.ROLE not in ("api", "worker", "all"):
         problems.append("ROLE 必须是 api / worker / all")
-    url = s.DATABASE_URL
-    if url.startswith("sqlite"):
-        problems.append("生产环境必须使用 PostgreSQL（DATABASE_URL=postgresql+psycopg://…）")
-    elif url.startswith(("postgres://", "postgresql://", "postgresql+psycopg://")):
-        _, pwd_raw, hostpart = _split_db_credentials(url)
-        host = (hostpart.split("/", 1)[0].split("?", 1)[0] if hostpart else "")
-        host_name = host.rsplit(":", 1)[0] if ":" in host and not host.startswith("[") else host
-        if not host_name:
-            problems.append("DATABASE_URL 缺少数据库主机名")
-        if not pwd_raw:
-            problems.append("DATABASE_URL 缺少数据库密码")
-        else:
-            raw = _decode_credential(pwd_raw)
-            if len(raw) < 16 or raw.lower() in DEFAULT_PG_PASSWORDS or raw.isdigit():
-                problems.append("DATABASE_URL 中的数据库密码过短或为常见默认值")
+
+    explicit_parts = bool(s.DB_USER and s.DB_HOST and s.DB_NAME)
+    if explicit_parts:
+        # The URL is assembled from DB_* parts by encode_db_url().
+        password = effective_db_password(s)
+        if not password:
+            problems.append("缺少数据库密码（DB_PASSWORD 未设置）")
+        elif len(password) < 16 or password.lower() in DEFAULT_PG_PASSWORDS or password.isdigit():
+            problems.append("DB_PASSWORD 过短或为常见默认值（至少 16 位且非纯数字）")
     else:
-        problems.append("DATABASE_URL 必须是 postgresql(+psycopg):// 或 sqlite:/// 格式")
+        url = s.DATABASE_URL
+        if url.startswith("sqlite"):
+            problems.append("生产环境必须使用 PostgreSQL（DATABASE_URL=postgresql+psycopg://…）")
+        elif url.startswith(("postgres://", "postgresql://", "postgresql+psycopg://")):
+            _, pwd_raw, hostpart = _split_db_credentials(url)
+            host = (hostpart.split("/", 1)[0].split("?", 1)[0] if hostpart else "")
+            host_name = host.rsplit(":", 1)[0] if ":" in host and not host.startswith("[") else host
+            if not host_name:
+                problems.append("DATABASE_URL 缺少数据库主机名")
+            if not pwd_raw:
+                problems.append("DATABASE_URL 缺少数据库密码")
+            else:
+                raw = _decode_credential(pwd_raw)
+                if len(raw) < 16 or raw.lower() in DEFAULT_PG_PASSWORDS or raw.isdigit():
+                    problems.append("DATABASE_URL 中的数据库密码过短或为常见默认值")
+        else:
+            problems.append("DATABASE_URL 必须是 postgresql(+psycopg):// 或 sqlite:/// 格式")
+
     if s.ALLOWED_ORIGINS.strip() and "*" in s.ALLOWED_ORIGINS:
         problems.append("生产环境 ALLOWED_ORIGINS 不允许使用通配符 *")
     if not s.ALLOWED_ORIGINS.strip():
@@ -183,13 +265,59 @@ def validate_production_config(s: "Settings") -> None:
 
 
 def encode_db_url(s: "Settings") -> str:
-    """Normalize driver and percent-encode credentials exactly once.
+    """Build the SQLAlchemy connection URL, percent-encoding credentials exactly once.
 
-    Idempotent: a credential that already carries percent-escapes is treated
-    as encoded and left untouched (never double-encoded); a raw credential is
-    encoded exactly once. Never re-quotes an already-encoded URL string
-    (that caused %40 -> %2540). Non-PostgreSQL URLs pass through untouched.
+    Two configuration sources, in priority order
+    ---------------------------------------------
+    1. **Explicit parts** (`DB_USER` + `DB_PASSWORD` + `DB_HOST` + `DB_NAME`)
+       — the preferred path, used by `docker-compose.prod.yml`. The password
+       is given as its LITERAL value and is percent-encoded exactly once
+       here. `DB_PASSWORD_ENCODED=true` means "this value is already
+       percent-encoded" — only for operators who deliberately store one.
+
+    2. **`DATABASE_URL`** — the credentials embedded in the URL are encoded
+       exactly once *unless* they already carry percent-escapes, in which
+       case they are passed through byte-for-byte.
+
+    Why "unless they already carry percent-escapes" is decided by *decoding*
+    ------------------------------------------------------------------------
+    A raw password and a percent-encoded password are indistinguishable as
+    strings whenever the raw one happens to contain '%' followed by two hex
+    digits. `pa%41ss` is the raw password "pa%41ss" OR the encoded form of
+    "paAss" — no string inspection can tell them apart, and guessing wrong
+    silently corrupts the credential (the server then rejects the login with
+    a confusing "password authentication failed").
+
+    The tie is broken by *what the escapes decode to*: `quote(value, safe="")`
+    escapes everything outside ``A-Za-z0-9_.-~``, so a genuinely encoded
+    credential must contain at least one escape that decodes to a character
+    outside that set. `pa%41ss` decodes to 'A' (always-safe) -> raw -> it is
+    encoded once and the server receives the literal "pa%41ss". `pa%40ss`
+    decodes to '@' (must be escaped) -> already encoded -> left untouched.
+
+    The single irreducible case is a raw password that literally contains
+    `%40`-style text. Use the explicit `DB_PASSWORD` setting for it — there
+    the encoding state is *stated*, not guessed.
+
+    Guarantees:
+      - no double encoding   (an encoded input is never quoted again)
+      - no wrong decoding    (a raw input is never unquoted)
+      - special characters (@ : / % + # space) survive a round trip
     """
+    # ---- source 1: explicit DB_USER / DB_PASSWORD (preferred) ----
+    db_user = (s.DB_USER or "").strip()
+    db_password = s.DB_PASSWORD or ""
+    db_host = (s.DB_HOST or "").strip()
+    db_port = s.DB_PORT or 5432
+    db_name = (s.DB_NAME or "").strip()
+
+    if db_user and db_host and db_name:
+        user_out = _encode_credential(db_user, _credential_is_encoded(db_user))
+        pwd_out = _encode_credential(db_password, s.DB_PASSWORD_ENCODED)
+        return (f"postgresql+psycopg://{user_out}:{pwd_out}"
+                f"@{db_host}:{db_port}/{db_name}")
+
+    # ---- source 2: DATABASE_URL ----
     url = s.DATABASE_URL
     if url.startswith("postgres://"):
         scheme, rest = "postgresql+psycopg", url[len("postgres://"):]
@@ -199,11 +327,12 @@ def encode_db_url(s: "Settings") -> str:
         scheme, rest = "postgresql+psycopg", url[len("postgresql+psycopg://"):]
     else:
         return url  # sqlite and others pass through untouched
+
     user, pwd, hostpart = _split_db_credentials(url)
     if user is None:
         return url
-    user_out = user if _looks_encoded(user) else quote(user, safe="")
-    pwd_out = pwd if (pwd is None or _looks_encoded(pwd)) else quote(pwd, safe="")
+    user_out = _encode_credential(user, _credential_is_encoded(user))
+    pwd_out = _encode_credential(pwd or "", _credential_is_encoded(pwd or ""))
     return f"{scheme}://{user_out}:{pwd_out}@{hostpart}"
 
 

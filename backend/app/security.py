@@ -38,27 +38,49 @@ BLOCKED_V4 = [
     "169.254.0.0/16",     # link-local (incl. 169.254.169.254 cloud metadata)
     "172.16.0.0/12",      # private
     "192.0.0.0/24",       # IETF protocol assignments
+    "192.0.0.9/32",       # PCP anycast
+    "192.0.0.10/32",      # TURN anycast
     "192.0.2.0/24",       # TEST-NET-1
+    "192.31.196.0/24",    # AS112-v4
+    "192.52.193.0/24",    # AMT
     "192.88.99.0/24",     # 6to4 relay anycast (deprecated)
     "192.168.0.0/16",     # private
+    "192.175.48.0/24",    # AS112
     "198.18.0.0/15",      # benchmarking
     "198.51.100.0/24",    # TEST-NET-2
     "203.0.113.0/24",     # TEST-NET-3
     "224.0.0.0/4",        # multicast
+    "233.252.0.0/24",     # MCAST test-net
     "240.0.0.0/4",        # reserved (incl. broadcast 255.255.255.255)
 ]
 BLOCKED_V6 = [
     "::/128",             # unspecified
     "::1/128",            # loopback
-    "::ffff:0:0/96",      # IPv4-mapped (also handled via .ipv4_mapped)
+    # NOTE: ::ffff:0:0/96 (IPv4-mapped) is deliberately NOT listed here.
+    # Windows returns ::ffff:a.b.c.d for ordinary IPv4 hosts, so blocking the
+    # whole range would break legitimate public IPv4 targets. Mapped addresses
+    # are delegated to the IPv4 rules instead (see is_public_ip step 1).
     "64:ff9b::/96",       # NAT64 (can embed private v4)
+    "64:ff9b:1::/48",     # local-use NAT64 (RFC 8215)
     "100::/64",           # discard-only
+    "2001::/23",          # IETF protocol assignments (incl. 2001:1::/32 PCP anycast,
+                          #  2001:2::/48 benchmarking, 2001:3::/32 AMT,
+                          #  2001:4:112::/48 AS112, 2001:20::/28 ORCHIDv2,
+                          #  2001:30::/28 Drone Remote ID) — NOT globally routable
     "2001:db8::/32",      # documentation
     "fc00::/7",           # unique local
     "fe80::/10",          # link-local
     "ff00::/8",           # multicast
     "2002::/16",          # 6to4 (can embed private v4)
     "2001::/32",          # Teredo (can embed private v4)
+    # --- ranges Python's ipaddress.is_global still reports as global ---
+    "2001:20::/28",       # ORCHIDv2 (RFC 7343) — not globally routable
+    "2001:30::/28",       # Drone Remote ID Protocol Entity Tags (RFC 9374)
+    "5f00::/16",          # SRv6 SIDs (RFC 9602) — segment-routing identifiers
+    "fec0::/10",          # site-local (RFC 3879, deprecated)
+    "2620:4f:8000::/48",  # AS112-v6 (RFC 7535)
+    "2620:fe::fe/128",    # 6bone anycast (RFC 3701, deprecated — not routable)
+    "3fff::/20",          # documentation (RFC 9637)
 ]
 _NETS_V4 = [ipaddress.ip_network(n) for n in BLOCKED_V4]
 _NETS_V6 = [ipaddress.ip_network(n) for n in BLOCKED_V6]
@@ -110,26 +132,52 @@ def trusted_internal_hosts() -> set[str]:
 def is_public_ip(ip_str: str) -> bool:
     """True only for globally-routable unicast addresses.
 
-    Handles IPv4-mapped IPv6, 6to4/Teredo/NAT64 wrappers, TEST-NETs,
-    multicast/broadcast, and any address Python's ipaddress considers
-    non-global. Anything ambiguous is denied.
+    Strictness rules:
+      - An address is public only if it is NOT in an explicit blocklist AND
+        Python's ipaddress considers it globally routable.
+      - Anything ambiguous is denied.
+
+    Evaluation order matters and is deliberate:
+
+    1. IPv4-mapped IPv6 (::ffff:a.b.c.d) is delegated to the IPv4 rules.
+       The effective target of such an address IS the embedded IPv4 address,
+       so the IPv4 classification is the one that matters. This must happen
+       BEFORE the IPv6 blocklist, otherwise the ::ffff:0:0/96 entry would
+       reject legitimate IPv4-mapped public addresses (Windows returns these
+       for ordinary IPv4 hosts).
+
+    2. The explicit IPv6 blocklist is checked next. It contains whole
+       special-purpose blocks (Teredo 2001::/32, 6to4 2002::/16, ORCHIDv2,
+       SRv6 SIDs, site-local, ...) that must never be reachable. Checking it
+       BEFORE the embedding logic is what makes those entries effective:
+       a 6to4 address embedding a *public* IPv4 (2002:0808:0808::) is still
+       a non-routable special-purpose address and must be denied.
+
+    3. 6to4 / Teredo embedding is examined for addresses not already denied
+       by (2). The embedded IPv4 is what the tunnel actually reaches, so a
+       private embedded address is denied even if the outer address looks
+       global. This is defence in depth for wrapper formats that slip past
+       a blocklist update.
     """
     try:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
         return False
     if ip.version == 6:
+        # (1) IPv4-mapped -> the embedded IPv4 decides
         mapped = getattr(ip, "ipv4_mapped", None)
         if mapped is not None:
-            return is_public_ip(str(mapped))          # ::ffff:127.0.0.1 -> v4 check
+            return is_public_ip(str(mapped))
+        # (2) explicit IPv6 blocklist
+        if any(ip in n for n in _NETS_V6):
+            return False
+        # (3) embedded-address checks (defence in depth)
         sixtofour = getattr(ip, "sixtofour", None)
         if sixtofour is not None:
             return is_public_ip(str(sixtofour))
         teredo = getattr(ip, "teredo", None)
         if teredo is not None:                          # (server, client) tuple
             return all(is_public_ip(str(t)) for t in teredo if t)
-        if any(ip in n for n in _NETS_V6):
-            return False
         return bool(ip.is_global)
     if any(ip in n for n in _NETS_V4):
         return False

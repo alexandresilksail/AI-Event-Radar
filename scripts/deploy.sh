@@ -25,6 +25,14 @@ for var in JWT_SECRET ADMIN_PASSWORD DB_PASSWORD; do
   val="${!var}"; [ ${#val} -ge 12 ] || fail "$var 长度不足（至少 12 位）"
 done
 [ "${#JWT_SECRET}" -ge 32 ] || fail "JWT_SECRET 至少 32 位"
+# 数据库密码强度：至少 16 位、非纯数字
+[ "${#DB_PASSWORD}" -ge 16 ] || fail "DB_PASSWORD 至少 16 位"
+case "$DB_PASSWORD" in
+  *[!0-9]*) : ;;
+  *) fail "DB_PASSWORD 不能是纯数字" ;;
+esac
+# 连接 URL 由应用层用 DB_* 离散字段组装（密码只编码一次），
+# 因此无需在此手工做 URL 编码——手工编码反而会造成双重编码。
 
 log "3/9 检查磁盘空间"
 avail_kb=$(df -Pk . | tail -1 | awk '{print $4}')
@@ -40,26 +48,43 @@ log "6/9 启动数据库并等待健康"
 $COMPOSE up -d db
 $COMPOSE ps db | grep -q healthy || fail "数据库未进入 healthy 状态：$COMPOSE ps db"
 
+# 真实启动顺序（由 docker-compose.prod.yml 的 depends_on 强制）：
+#   db(healthy) -> migrate(必须 exit 0) -> api + worker -> web
+# migrate 是一次性服务；api/worker 依赖它的 service_completed_successfully，
+# 因此迁移失败时 api 与 worker 根本不会启动。
 log "7/9 启动 API（先由独立 migrate 服务执行一次性 schema 迁移）与 Web"
 $COMPOSE up -d api web
 $COMPOSE ps migrate | grep -q "exited (0)" || fail "迁移服务未成功完成：$COMPOSE logs migrate"
 
 log "8/9 等待健康检查通过"
 base="http://localhost:${HTTP_PORT:-80}"
+# 注意路径：nginx 的 `location /api/` 会剥掉 /api 前缀转发给 api:8000，
+# 而裸的 /health/live 会落到 SPA 的 `location /`（返回 index.html），
+# 那样的检查恒为成功，等于没有检查。必须走 /api/ 前缀。
 for i in $(seq 1 40); do
-  if curl -fsS "$base/health/live" >/dev/null 2>&1; then
+  if curl -fsS "$base/api/health/live" >/dev/null 2>&1; then
      if curl -fsS "$base/api/health/ready" | grep -q '"status":"ready"'; then
        log "健康检查通过"; break
      fi
   fi
-  [ $i -eq 40 ] && fail "健康检查未通过（40 次重试后）：curl $base/health/live"
+  [ $i -eq 40 ] && fail "健康检查未通过（40 次重试后）：curl $base/api/health/ready"
   sleep 3
 done
 
+# Worker 必须真正进入 healthy，而不只是"容器在跑"——worker 启动失败
+# （例如数据库连不上、租约获取失败）会表现为 unhealthy，这里必须识别出来。
 log "9/9 启动后台采集 Worker（单调度实例，DB 领导锁）"
 $COMPOSE up -d worker
-sleep 2
-$COMPOSE ps worker | grep -q Up || fail "worker 未启动：$COMPOSE logs worker"
+worker_ok=0
+for i in $(seq 1 40); do
+  state=$($COMPOSE ps worker --format '{{.Status}}' 2>/dev/null | head -1)
+  case "$state" in
+    *healthy*) worker_ok=1; break ;;
+    *unhealthy*|*exited*) fail "worker 启动失败（状态: $state）：$COMPOSE logs worker" ;;
+  esac
+  sleep 3
+done
+[ "$worker_ok" -eq 1 ] || fail "worker 未在 120 秒内进入 healthy 状态：$COMPOSE ps worker"
 
 log "验证调度状态（worker 侧 leader lock）"
 status=$(curl -fsS "$base/api/status") || fail "无法读取 /status"

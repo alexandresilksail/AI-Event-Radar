@@ -278,7 +278,62 @@ bash scripts/restore.sh backups/radar_YYYYMMDD_HHMMSS.sql.gz   # 需输入 RESTO
 
 ---
 
-## 十三、最终放行判定
+## 十三、v1.5 审计轮新增的 BLOCKING 复验项（⛔ 全部 BLOCKING）
+
+本轮（v1.5，审计基线 commit `a4d7124`）修复了 **3 项 P0 + 4 项 P1**，全部有回归测试锁定并通过。
+但以下 3 项在当前环境**客观无法验证**（无 Docker 守护进程；PostgreSQL 的 Windows 二进制在本主机
+`initdb` 阶段崩溃于 `ucrtbase.dll` / `0xC0000409`，两套独立构建同样复现），必须在目标环境复验。
+
+### B1 — Docker 镜像构建与容器编排（⛔ BLOCKING）
+
+```bash
+bash scripts/deploy.sh
+```
+
+必须全部满足：
+
+- [ ] `docker compose build` 三个镜像构建成功（api / web / db）
+- [ ] `migrate` 一次性服务 **exit 0**（`docker compose ps migrate` 显示 `exited (0)`）
+- [ ] 迁移失败时 `api` 与 `worker` **根本不会启动**（`service_completed_successfully` 生效）
+- [ ] `api` 与 `worker` 均进入 **healthy**（不是仅 `Up`）
+- [ ] `curl http://localhost/api/health/live` 与 `curl http://localhost/api/health/ready` 返回 200
+      （注意：**不可**用 `/health/live`，该路径落到 SPA 的 `location /`，恒返回 index.html）
+- [ ] 数据库口令含 `@ : / % + #` 与空格时，migrate / api / worker **连到同一个库**且能成功登录
+
+### B2 — 真实 PostgreSQL 上的调度锁 / fencing 复验（⛔ BLOCKING）
+
+本轮的多进程竞争测试跑在 SQLite 上；PostgreSQL 的锁语义不同，必须复跑：
+
+```bash
+cd backend
+pytest tests/test_scheduler_lock_stress.py tests/test_lease_fencing.py -v
+```
+
+必须全部满足：
+
+- [ ] 多进程竞争只有一个胜者，失败者无法心跳、无法通过 fencing
+- [ ] 租约过期被接管后，旧 Leader 的**下一次业务写入被 fence**（不得产生重复事件 / 重复通知）
+- [ ] 旧 Leader 恢复后无法续约、无法提交
+- [ ] 数据库短暂不可用时不写库
+
+### B3 — 真实 PostgreSQL 上的凭据与迁移端到端复验（⛔ BLOCKING）
+
+```bash
+cd backend
+pytest tests/test_db_connection_wire.py -v
+python -m app.migrate        # 指向真实 PostgreSQL
+```
+
+必须全部满足：
+
+- [ ] 口令 `P@ss:w/rd%+er#2026 x` 能成功连接真实 PostgreSQL
+- [ ] `ALTER USER ... WITH PASSWORD '<含特殊字符口令>'` 后，驱动以同一口令成功认证
+- [ ] 迁移链在真实 PostgreSQL 上全部执行成功
+- [ ] `create_engine()` 不再因重复关键字参数而失败（本轮 P0 的直接验证）
+
+---
+
+## 十四、最终放行判定
 
 | 阶段 | 状态 | 阻断发布 |
 |---|---|---|
@@ -297,13 +352,20 @@ bash scripts/restore.sh backups/radar_YYYYMMDD_HHMMSS.sql.gz   # 需输入 RESTO
 | 9 备份恢复（SQLite） | ✅ 通过 | 否 |
 | 9 备份恢复（PostgreSQL） | ⚠️ NOT VERIFIED | **是** |
 | 10 24h 运行 | ⚠️ NOT VERIFIED | **是** |
+| v1.5 B1 Docker 编排实测 | ⚠️ NOT VERIFIED | **是** |
+| v1.5 B2 真实 PostgreSQL 调度锁复验 | ⚠️ NOT VERIFIED | **是** |
+| v1.5 B3 真实 PostgreSQL 凭据与迁移 | ⚠️ NOT VERIFIED | **是** |
 
 ### 判定结论
 
 **当前状态：CONDITIONAL READY（有条件放行）**
 
-- 已在验收环境实测的 **11 个维度全部通过**，且修复了 **11 项真实缺陷**（2 项 P0、7 项 P1、2 项 P2）
-- **8 个维度标记为 NOT VERIFIED**，原因是环境客观限制（无 Docker、无域名与会话时长限制），**不是"未发现问题"**
+- v1.5 审计轮：修复 **3 项 P0 + 4 项 P1**（含 1 项此前从未被任何测试暴露的 P0 生产启动阻断缺陷
+  `app/database.py`），**未修复的 P0/P1 = 0**，不阻断发布；新增 6 个测试文件、244 项回归测试
+- 全量测试套件 **598 passed / 3 deselected / 0 failed**（退出码 0）；干净环境后端与前端构建退出码 0；
+  迁移 / 启动 / 故障恢复冒烟 `rc=0`；`pip-audit` 零漏洞
+- **NOT VERIFIED 的原因是环境客观限制**（无 Docker 守护进程；PostgreSQL Windows 二进制在本主机
+  `initdb` 崩溃），**不是"未发现问题"**
 - 上述标 **BLOCKING** 的项目全部通过后，本版本可升级为 **READY**
 
 ### 放行签字
